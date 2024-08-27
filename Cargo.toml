@@ -1,0 +1,16 @@
+[package]
+name = "ibverbs-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.86"
+bincode = "1.3.3"
+clap = { version = "4.5.16", features = ["derive"] }
+env_logger = "0.11.5"
+log = "0.4.22"
+rand = "0.8.5"
+rdma-sys = "0.3.0"
+serde = { version = "1.0.209", features = ["derive", "serde_derive"] }
