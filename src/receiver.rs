@@ -1,7 +1,7 @@
-use std::{io::{Read, Write}, net::{IpAddr, TcpListener}, thread};
+use std::{io::{Read, Write}, net::{IpAddr, TcpListener}, sync::Arc, thread};
 use log::info;
 
-use crate::{Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvSge, IbvWrOpcode, LookUpBy, MrMetadata, QpMetadata, SocketComm, SocketCommCommand};
+use crate::{Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvSge, IbvWcOpcode, IbvWrOpcode, LookUpBy, MrMetadata, QpMetadata, SendRecv, SocketComm, SocketCommCommand};
 
 pub struct Receiver{
     device: IbvDevice,
@@ -10,7 +10,7 @@ pub struct Receiver{
     receiver_metadata_mr: IbvMr,
     sender_metadata_address: u64,
     sender_metadata_rkey: u32,
-    pub pd: IbvPd,
+    pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     qp_metadata_list: Vec<QpMetadata>,
 }
@@ -18,18 +18,13 @@ pub struct Receiver{
 impl Receiver {
     pub fn new(look_up_by: LookUpBy, listen_socket_port: u16) -> anyhow::Result<Receiver> {
         let device = IbvDevice::new(look_up_by)?;
-        info!("Receiver created device");
-        // check is device context is not null
         if device.context.as_ptr().is_null() {
             return Err(anyhow::anyhow!("Device context is null"));
         }
-        let pd = IbvPd::new(&device.context);
-        info!("Receiver created pd");
+        let pd = Arc::new(IbvPd::new(device.context()));
         let receiver_metadata = MrMetadata::default();
-        info!("Receiver created metadata");
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-        let receiver_metadata_mr = IbvMr::new(&pd, receiver_metadata.addr(), MrMetadata::SIZE, access_flags);
-        info!("Receiver created metadata memory region with addr: {}, rkey: {}", receiver_metadata_mr.addr(), receiver_metadata_mr.rkey());
+        let receiver_metadata_mr = IbvMr::new(pd.clone(), receiver_metadata.addr(), MrMetadata::SIZE, access_flags);
         Ok(Receiver{
             device,
             listen_socket_port,
@@ -42,8 +37,13 @@ impl Receiver {
             qp_metadata_list: Vec::new(),
         })
     }
+    pub fn pd(&self) -> Arc<IbvPd> {
+        Arc::clone(&self.pd)
+    }
+    pub fn get_receiver_metadata(&self) -> MrMetadata {
+        self.receiver_metadata.clone()
+    }
     pub fn listen(&mut self, hints: Hints) -> anyhow::Result<()> {
-        info!("Receiver starts to listen on port {}", self.listen_socket_port);
         let address = match hints{
             Hints::Address(address) => {
                 address
@@ -69,20 +69,17 @@ impl Receiver {
                 SocketCommCommand::Mr(metadata) => {
                     self.sender_metadata_address = metadata.address;
                     self.sender_metadata_rkey = metadata.rkey;
-                    info!("Receiver received metadata from sender: address: {}, rkey: {}", self.sender_metadata_address, self.sender_metadata_rkey);
                     let recv_metadata = MrMetadata{
                         address: self.receiver_metadata_mr.addr(),
                         rkey: self.receiver_metadata_mr.rkey(),
                         length: 0,
                     };
-                    info!("Receiver sending metadata to sender: address: {}, rkey: {}", recv_metadata.address, recv_metadata.rkey);
                     in_tx.send(SocketCommCommand::Mr(recv_metadata)).unwrap();
                 },
                 SocketCommCommand::InitQp(idx, family) => {
-                    info!("Receiver received qp init command");
                     let gid_entry = self.device.gid_table.get_entry_by_index(idx as usize, family.clone());
                     if let Some((_ip_addr, gid_entry)) = gid_entry{
-                        let qp = IbvQp::new(&self.pd, &self.device.context, gid_entry.gidx(), gid_entry.port());
+                        let qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port());
                         qp.init(gid_entry.port)?;
                         let qpn = qp.qp_num();
                         let psn = qp.psn();
@@ -101,13 +98,11 @@ impl Receiver {
                     }
                 },
                 SocketCommCommand::ConnectQp(qp_metadata) => {
-                    info!("Receiver received qp connect command with remote qp metadata: {:?}", qp_metadata);
                     self.qp_metadata_list.push(qp_metadata);
                     in_tx.send(SocketCommCommand::ConnectQp(QpMetadata::default())).unwrap();
                 },
                 SocketCommCommand::Stop => { 
                     in_tx.send(SocketCommCommand::Stop).unwrap();
-                    info!("Receiver received stop command");
                     break; 
                 },
             }
@@ -129,9 +124,8 @@ impl Receiver {
                 self.sender_metadata_address,
                 self.sender_metadata_rkey,
             );
-            info!("Receiver posting send");
             qp.ibv_post_send(send_wr)?;
-            info!("Receiver send posted");
+            qp.complete(1, IbvWcOpcode::Send, SendRecv::Send)?;
         }
         Ok(())
     }

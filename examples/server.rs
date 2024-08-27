@@ -1,5 +1,5 @@
 use clap::Parser;
-use ibverbs_rs::{receiver::Receiver, Hints, IbvAccessFlags, IbvMr, IbvRecvWr, IbvSendWr, IbvSge, LookUpBy, MrMetadata};
+use ibverbs_rs::{receiver::Receiver, Hints, IbvRecvWr, IbvSge, IbvWcOpcode, LookUpBy, MrMetadata, SendRecv};
 use log::info;
 
 #[derive(Parser)]
@@ -26,20 +26,20 @@ fn main() -> anyhow::Result<()> {
     )?;
     let hints = Hints::Address(address.parse().unwrap());
     receiver.listen(hints)?;
-    //let flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-    //let mr = IbvMr::new(&receiver.pd, buf.as_ptr() as *mut u8, buf.len(), flags as i32);
+
+    receiver.connect()?;
+    receiver.qp_list[0].state()?;
+    info!("expecting metadata at address: {}, rkey: {}", receiver.metadata_addr(), receiver.metadata_rkey());
+
     let sge = IbvSge::new(receiver.metadata_addr(), MrMetadata::SIZE as u32, receiver.metadata_lkey());
     let notify_wr = IbvRecvWr::new(0,sge,1);
-    info!("Posting receive");
     receiver.qp_list[0].ibv_post_recv(notify_wr)?;
-    receiver.connect()?;
-    info!("Receiver connected all QPs");
-    receiver.qp_list[0].state()?;
-
-
-    info!("Waiting for event");
-    receiver.qp_list[0].wait_for_event()?;
+    receiver.qp_list[0].complete(1, IbvWcOpcode::RecvRdmaWithImm, SendRecv::Recv)?;
     info!("Event received");
+    //info!("{:#?}",receiver.get_receiver_metadata());
+    let ptr = receiver.metadata_addr() as *mut MrMetadata;
+    let mr_metadata = unsafe{&*ptr};
+    info!("{:#?}",mr_metadata);
     Ok(())
 
 }
