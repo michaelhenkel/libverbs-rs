@@ -1,7 +1,5 @@
 use std::{io::{Read, Write}, net::{IpAddr, TcpListener}, sync::Arc, thread};
-use log::info;
-
-use crate::{Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvSge, IbvWcOpcode, IbvWrOpcode, LookUpBy, MrMetadata, QpMetadata, SendRecv, SocketComm, SocketCommCommand};
+use crate::{Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, MrMetadata, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand};
 
 pub struct Receiver{
     device: IbvDevice,
@@ -15,10 +13,11 @@ pub struct Receiver{
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     qp_metadata_list: Vec<QpMetadata>,
+    qp_mode: QpMode,
 }
 
 impl Receiver {
-    pub fn new(look_up_by: LookUpBy, listen_socket_port: u16) -> anyhow::Result<Receiver> {
+    pub fn new(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode) -> anyhow::Result<Receiver> {
         let device = IbvDevice::new(look_up_by)?;
         if device.context.as_ptr().is_null() {
             return Err(anyhow::anyhow!("Device context is null"));
@@ -43,6 +42,7 @@ impl Receiver {
             pd: pd.clone(),
             qp_list: Vec::new(),
             qp_metadata_list: Vec::new(),
+            qp_mode,
         })
     }
     pub fn create_metadata_mr(&mut self) -> anyhow::Result<()> {
@@ -103,7 +103,11 @@ impl Receiver {
                     in_tx.send(SocketCommCommand::Mr(recv_metadata)).unwrap();
                 },
                 SocketCommCommand::InitQp(idx, family) => {
-                    let gid_entry = self.device.gid_table.get_entry_by_index(idx as usize, family.clone());
+                    let gid_idx = match self.qp_mode{
+                        QpMode::Multi => {idx},
+                        QpMode::Single => {0}
+                    };
+                    let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, family.clone());
                     if let Some((_ip_addr, gid_entry)) = gid_entry{
                         let qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port());
                         qp.init(gid_entry.port)?;
@@ -120,17 +124,18 @@ impl Receiver {
                         };
                         in_tx.send(SocketCommCommand::ConnectQp(qp_metadata)).unwrap();
                     } else {
-                        return Err(anyhow::anyhow!("No GID entry found for index {} and family {:?}", idx, family));
+                        return Err(anyhow::anyhow!("No GID entry found for index {} and family {:?}", gid_idx, family));
                     }
                 },
                 SocketCommCommand::ConnectQp(qp_metadata) => {
                     self.qp_metadata_list.push(qp_metadata);
-                    in_tx.send(SocketCommCommand::ConnectQp(QpMetadata::default())).unwrap();
+                    in_tx.send(SocketCommCommand::Continue).unwrap();
                 },
                 SocketCommCommand::Stop => { 
                     in_tx.send(SocketCommCommand::Stop).unwrap();
                     break; 
                 },
+                SocketCommCommand::Continue => { continue; },
             }
         }
         Ok(())
@@ -141,19 +146,13 @@ impl Receiver {
             let new_metadata = MrMetadata::default();
             let mr = IbvMr::new(self.pd.clone(), &new_metadata, MrMetadata::SIZE, IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32());
             qp.connect(remote_qp_metadata)?;
-            let sge = IbvSge::new(mr.addr(), MrMetadata::SIZE as u32, mr.lkey());
-            let flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
             let send_wr = IbvSendWr::new(
-                0,
-                sge,
-                1,
-                IbvWrOpcode::Send,
-                flags,
+                &mr,
                 self.sender_metadata_address,
                 self.sender_metadata_rkey,
+                IbvWrOpcode::Send,
             );
-            qp.ibv_post_send(send_wr)?;
-            //info!("send posted, waiting for completion");
+            qp.ibv_post_send(send_wr.as_ptr())?;
             qp.complete(1, IbvWcOpcode::Send, SendRecv::Send)?;
         }
         Ok(())
@@ -186,6 +185,9 @@ fn socket_listener(listen_address: IpAddr, port: u16, out_tx: std::sync::mpsc::S
                 let local_socket_comm = in_rx.recv().unwrap();
                 if let SocketCommCommand::Stop = local_socket_comm {
                     break;
+                }
+                if let SocketCommCommand::Continue = local_socket_comm {
+                    continue;
                 }
                 let serialized = bincode::serialize(&local_socket_comm).unwrap();
                 stream.write_all(&serialized).unwrap();

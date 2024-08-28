@@ -1,5 +1,5 @@
 use clap::Parser;
-use ibverbs_rs::{receiver::Receiver, Hints, IbvAccessFlags, IbvMr, IbvRecvWr, IbvSendWr, IbvSge, IbvWcOpcode, IbvWrOpcode, LookUpBy, Message, MrMetadata, SendRecv};
+use ibverbs_rs::{receiver::Receiver, Hints, IbvAccessFlags, IbvMr, IbvRecvWr, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, MrMetadata, QpMode, SendRecv};
 use log::info;
 
 #[derive(Parser)]
@@ -23,6 +23,7 @@ fn main() -> anyhow::Result<()> {
     let mut receiver = Receiver::new(
         LookUpBy::Name(device_name),
         port,
+        QpMode::Single
     )?;
     receiver.create_metadata_mr()?;
     let hints = Hints::Address(address.parse().unwrap());
@@ -30,14 +31,11 @@ fn main() -> anyhow::Result<()> {
     receiver.connect()?;
     receiver.qp_list[0].state()?;
 
-    let sge = IbvSge::new(receiver.metadata_addr(), MrMetadata::SIZE as u32, receiver.metadata_lkey());
-    let notify_wr = IbvRecvWr::new(0,sge,1);
+    let notify_wr = IbvRecvWr::new(&receiver.get_receiver_metadata_mr().unwrap());
     receiver.qp_list[0].ibv_post_recv(notify_wr)?;
     receiver.qp_list[0].complete(1, IbvWcOpcode::RecvRdmaWithImm, SendRecv::Recv)?;
     let msg_len = receiver.get_receiver_metadata().length;
-    let buffer = Message{
-        id: 0,
-    };
+    let buffer: [u8;65536*100] = [0;65536*100]; 
     let flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
     let msg_mr = IbvMr::new(receiver.pd(), &buffer, msg_len as usize, flags);
     let new_mr_metadata = MrMetadata{
@@ -47,23 +45,25 @@ fn main() -> anyhow::Result<()> {
         length: msg_len as u64,
     };
     let metadata_mr = IbvMr::new(receiver.pd(), &new_mr_metadata, MrMetadata::SIZE, flags);
-    let sge = IbvSge::new(metadata_mr.addr(), MrMetadata::SIZE as u32, metadata_mr.lkey());
     let send_wr = IbvSendWr::new(
-        0,
-        sge,
-        1,
-        IbvWrOpcode::RdmaWriteWithImm,
-        flags,
+        &metadata_mr,
         receiver.sender_metadata_address,
         receiver.sender_metadata_rkey,
+        IbvWrOpcode::RdmaWriteWithImm,
     );
-    receiver.qp_list[0].ibv_post_send(send_wr)?;
+    receiver.qp_list[0].ibv_post_send(send_wr.as_ptr())?;
     receiver.qp_list[0].complete(1, IbvWcOpcode::RdmaWrite, SendRecv::Send)?;
-    let notify_sge = IbvSge::new(receiver.metadata_addr(), MrMetadata::SIZE as u32, receiver.metadata_lkey());
-    let notify_wr = IbvRecvWr::new(0,notify_sge,1);
+    let notify_wr = IbvRecvWr::new(&receiver.get_receiver_metadata_mr().unwrap());
     receiver.qp_list[0].ibv_post_recv(notify_wr)?;
     receiver.qp_list[0].complete(1, IbvWcOpcode::RecvRdmaWithImm, SendRecv::Recv)?;
-    info!("Buffer: {:#?}", buffer);
+    // count amount of 1s in buffer
+    let mut count = 0;
+    for i in 0..msg_len as usize {
+        if buffer[i] == 1 {
+            count += 1;
+        }
+    }
+    info!("Buffer 1: {:#?}", count);
     Ok(())
 
 }

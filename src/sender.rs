@@ -1,5 +1,5 @@
 use std::{io::{Read, Write}, net::{IpAddr, TcpStream}, sync::Arc};
-use crate::{Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvSge, IbvWcOpcode, LookUpBy, MrMetadata, QpMetadata, SendRecv, SocketComm, SocketCommCommand};
+use crate::{Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvWcOpcode, LookUpBy, MrMetadata, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand};
 
 pub struct Sender{
     device: IbvDevice,
@@ -12,16 +12,15 @@ pub struct Sender{
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     num_qps: u32,
-    family: Family
+    family: Family,
+    qp_mode: QpMode,
 }
 
 impl Sender {
-    pub fn new(look_up_by: LookUpBy, receiver_socket_address: IpAddr, receiver_socket_port: u16, num_qps: u32, family: Family) -> anyhow::Result<Sender> {
+    pub fn new(look_up_by: LookUpBy, receiver_socket_address: IpAddr, receiver_socket_port: u16, num_qps: u32, family: Family, qp_mode: QpMode) -> anyhow::Result<Sender> {
         let device = IbvDevice::new(look_up_by)?;
         let pd = Arc::new(IbvPd::new(device.context()));
         let sender_metadata = MrMetadata::default();
-        let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-        let sender_metadata_mr = IbvMr::new(pd.clone(), &sender_metadata, MrMetadata::SIZE, access_flags);
         Ok(Sender{
             device,
             receiver_socket_address,
@@ -33,7 +32,8 @@ impl Sender {
             pd,
             qp_list: Vec::new(),
             num_qps,
-            family
+            family,
+            qp_mode,
         })
     }
     pub fn create_metadata(&mut self) -> anyhow::Result<()> {
@@ -43,6 +43,9 @@ impl Sender {
         self.sender_metadata.address = sender_metadata_mr.addr();
         self.sender_metadata.rkey = sender_metadata_mr.rkey();
         Ok(())
+    }
+    pub fn get_sender_metadata_mr(&self) -> IbvMr {
+        self.sender_metadata_mr.clone().unwrap()
     }
     pub fn get_sender_metadata(&self) -> MrMetadata {
         self.sender_metadata.clone()
@@ -92,7 +95,11 @@ impl Sender {
             self.receiver_metadata_rkey = metadata.rkey;
         }
         for qp_idx in 0..self.num_qps {
-            let gid_entry = self.device.gid_table.get_entry_by_index(qp_idx as usize, self.family.clone());
+            let gid_idx = match self.qp_mode {
+                QpMode::Single => 0,
+                QpMode::Multi => qp_idx,
+            };
+            let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, self.family.clone());
             if let Some((_ip_addr, gid_entry)) = gid_entry{
                 let qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port());
                 qp.init(gid_entry.port)?;
@@ -132,8 +139,7 @@ impl Sender {
         let serialized = bincode::serialize(&socket_comm).unwrap();
         stream.write(&serialized).unwrap();
         for qp in &self.qp_list{
-            let sge = IbvSge::new(self.metadata_addr(), MrMetadata::SIZE as u32, self.metadata_lkey());
-            let notify_wr = IbvRecvWr::new(0,sge,1);
+            let notify_wr = IbvRecvWr::new(&self.get_sender_metadata_mr());
             qp.ibv_post_recv(notify_wr)?;
             qp.complete(1, IbvWcOpcode::Recv, SendRecv::Recv)?;
         }
@@ -143,12 +149,11 @@ impl Sender {
         for qp in &self.qp_list {
             qp.event_channel().destroy();
             qp.recv_cq().destroy();
+            qp.send_cq().destroy();
             qp.destroy();
         }
         self.pd.destroy();
-
         self.device.destroy();
-
         Ok(())
     }
 }
