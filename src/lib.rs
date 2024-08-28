@@ -872,49 +872,68 @@ impl Drop for IbvContext{
 unsafe impl Send for IbvContext{}
 unsafe impl Sync for IbvContext{}
 
+#[derive(Clone)]
 pub struct IbvMr{
     inner: Box<*mut ibv_mr>,
+    addr: u64,
+    length: usize,
+    lkey: u32,
+    rkey: u32,
 }
 
 impl IbvMr{
-    pub fn new(pd: Arc<IbvPd>, addr: *mut u8, length: usize, access: i32) -> Self{
-        let addr = addr as *mut std::ffi::c_void;
+    pub fn new<T>(pd: Arc<IbvPd>, t: &T, length: usize, access: i32) -> Self{
+        let addr = t as *const T as *mut c_void;
         let mr = unsafe{ ibv_reg_mr(pd.as_ptr(), addr, length, access) };
         let _addr = unsafe { (*mr).addr };
         let _rkey = unsafe { (*mr).rkey };
         let _lkey = unsafe { (*mr).lkey };
-        info!("MR addr: {}, rkey: {}, lkey: {}", _addr as u64, _rkey, _lkey);
+        let _len = unsafe { (*mr).length };
         let inner = Box::new(mr);
         IbvMr{
             inner,
+            addr: _addr as u64,
+            length: _len as usize,
+            lkey: _lkey,
+            rkey: _rkey,
         }
     }
     pub fn as_ptr(&self) -> *mut ibv_mr{
         *self.inner
     }
+    
     pub fn addr(&self) -> u64{
-        unsafe{ (*self.as_ptr()).addr as u64 }
+        //unsafe{ (*self.as_ptr()).addr as u64 }
+        self.addr
     }
     pub fn length(&self) -> usize{
-        unsafe{ (*self.as_ptr()).length as usize }
+        //unsafe{ (*self.as_ptr()).length as usize }
+        self.length
     }
     pub fn lkey(&self) -> u32{
-        unsafe{ (*self.as_ptr()).lkey }
+        //unsafe{ (*self.as_ptr()).lkey }
+        self.lkey
     }
     pub fn rkey(&self) -> u32{
-        unsafe{ (*self.as_ptr()).rkey }
+        //unsafe{ (*self.as_ptr()).rkey }
+        self.rkey
     }
+    
     pub fn destroy(&self){
         unsafe{ ibv_dereg_mr(self.as_ptr()) };
     }
+    pub fn convert<T>(&self) -> *mut T{
+        self.addr as *mut T
+    }
 }
 
-
+/*
 impl Drop for IbvMr{
     fn drop(&mut self){
         unsafe{ ibv_dereg_mr(self.as_ptr()) };
     }
 }
+*/
 
 unsafe impl Send for IbvMr{}
 unsafe impl Sync for IbvMr{}
@@ -1194,11 +1213,12 @@ pub enum Hints{
     AddressFamily(Family),
     Address(IpAddr),
 }
-
+#[repr(C)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MrMetadata{
     pub address: u64,
     pub rkey: u32,
+    pub padding: u32,
     pub length: u64,
 }
 
@@ -1228,4 +1248,15 @@ pub enum SocketCommCommand{
     InitQp(u32, Family),
     ConnectQp(QpMetadata),
     Stop,
+}
+
+#[derive(Debug)]
+pub struct Message{
+    pub id: u64,
+}
+
+impl Message{
+    pub fn len(&self) -> usize{
+        std::mem::size_of::<Message>()
+    }
 }

@@ -6,10 +6,12 @@ use crate::{Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, Ib
 pub struct Receiver{
     device: IbvDevice,
     listen_socket_port: u16,
-    receiver_metadata: MrMetadata,
-    receiver_metadata_mr: IbvMr,
-    sender_metadata_address: u64,
-    sender_metadata_rkey: u32,
+    pub receiver_metadata: MrMetadata,
+    receiver_metadata_mr: Option<IbvMr>,
+    receiver_metadata_address: u64,
+    receiver_metadata_rkey: u32,
+    pub sender_metadata_address: u64,
+    pub sender_metadata_rkey: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     qp_metadata_list: Vec<QpMetadata>,
@@ -22,20 +24,43 @@ impl Receiver {
             return Err(anyhow::anyhow!("Device context is null"));
         }
         let pd = Arc::new(IbvPd::new(device.context()));
-        let receiver_metadata = MrMetadata::default();
-        let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-        let receiver_metadata_mr = IbvMr::new(pd.clone(), receiver_metadata.addr(), MrMetadata::SIZE, access_flags);
+        let receiver_metadata = MrMetadata{
+            address: 7,
+            rkey: 8,
+            padding: 9,
+            length: 10,
+        };
+
         Ok(Receiver{
             device,
             listen_socket_port,
             receiver_metadata,
+            receiver_metadata_address: 0,
+            receiver_metadata_rkey: 0,
             sender_metadata_address: 0,
             sender_metadata_rkey: 0,
-            receiver_metadata_mr,
-            pd,
+            receiver_metadata_mr: None,
+            pd: pd.clone(),
             qp_list: Vec::new(),
             qp_metadata_list: Vec::new(),
         })
+    }
+    pub fn create_metadata_mr(&mut self) -> anyhow::Result<()> {
+        let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
+        let receiver_metadata_mr = IbvMr::new(self.pd.clone(), &self.receiver_metadata, MrMetadata::SIZE, access_flags);
+        let receiver_metadata_address = receiver_metadata_mr.addr();
+        let receiver_metadata_rkey = receiver_metadata_mr.rkey();
+        self.receiver_metadata_mr = Some(receiver_metadata_mr.clone());
+        self.receiver_metadata_address = receiver_metadata_address;
+        self.receiver_metadata_rkey = receiver_metadata_rkey;
+        Ok(())
+    }
+    pub fn get_receiver_metadata_mr(&self) -> Option<IbvMr> {
+        self.receiver_metadata_mr.clone()
+    }
+    pub fn get_receiver_metadata_address(&self) -> u64 {
+        let ptr = &self.receiver_metadata as *const MrMetadata;
+        ptr as u64
     }
     pub fn pd(&self) -> Arc<IbvPd> {
         Arc::clone(&self.pd)
@@ -70,8 +95,9 @@ impl Receiver {
                     self.sender_metadata_address = metadata.address;
                     self.sender_metadata_rkey = metadata.rkey;
                     let recv_metadata = MrMetadata{
-                        address: self.receiver_metadata_mr.addr(),
-                        rkey: self.receiver_metadata_mr.rkey(),
+                        address: self.receiver_metadata_address,
+                        rkey: self.receiver_metadata_rkey,
+                        padding: 0,
                         length: 0,
                     };
                     in_tx.send(SocketCommCommand::Mr(recv_metadata)).unwrap();
@@ -112,8 +138,10 @@ impl Receiver {
     pub fn connect(&mut self) -> anyhow::Result<()> {
         for (qp_idx, qp) in self.qp_list.iter().enumerate() {
             let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
+            let new_metadata = MrMetadata::default();
+            let mr = IbvMr::new(self.pd.clone(), &new_metadata, MrMetadata::SIZE, IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32());
             qp.connect(remote_qp_metadata)?;
-            let sge = IbvSge::new(self.metadata_addr(), MrMetadata::SIZE as u32, self.metadata_lkey());
+            let sge = IbvSge::new(mr.addr(), MrMetadata::SIZE as u32, mr.lkey());
             let flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
             let send_wr = IbvSendWr::new(
                 0,
@@ -125,18 +153,19 @@ impl Receiver {
                 self.sender_metadata_rkey,
             );
             qp.ibv_post_send(send_wr)?;
+            //info!("send posted, waiting for completion");
             qp.complete(1, IbvWcOpcode::Send, SendRecv::Send)?;
         }
         Ok(())
     }
     pub fn metadata_addr(&self) -> u64 {
-        self.receiver_metadata_mr.addr()
+        self.receiver_metadata_mr.as_ref().unwrap().addr()
     }
     pub fn metadata_lkey(&self) -> u32 {
-        self.receiver_metadata_mr.lkey()
+        self.receiver_metadata_mr.as_ref().unwrap().lkey()
     }
     pub fn metadata_rkey(&self) -> u32 {
-        self.receiver_metadata_mr.rkey()
+        self.receiver_metadata_mr.as_ref().unwrap().rkey()
     }
 }
 

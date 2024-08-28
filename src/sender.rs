@@ -6,7 +6,7 @@ pub struct Sender{
     receiver_socket_address: IpAddr,
     receiver_socket_port: u16,
     sender_metadata: MrMetadata,
-    sender_metadata_mr: IbvMr,
+    sender_metadata_mr: Option<IbvMr>,
     pub receiver_metadata_address: u64,
     pub receiver_metadata_rkey: u32,
     pub pd: Arc<IbvPd>,
@@ -21,7 +21,7 @@ impl Sender {
         let pd = Arc::new(IbvPd::new(device.context()));
         let sender_metadata = MrMetadata::default();
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-        let sender_metadata_mr = IbvMr::new(pd.clone(), sender_metadata.addr(), MrMetadata::SIZE, access_flags);
+        let sender_metadata_mr = IbvMr::new(pd.clone(), &sender_metadata, MrMetadata::SIZE, access_flags);
         Ok(Sender{
             device,
             receiver_socket_address,
@@ -29,12 +29,20 @@ impl Sender {
             sender_metadata,
             receiver_metadata_address: 0,
             receiver_metadata_rkey: 0,
-            sender_metadata_mr,
+            sender_metadata_mr: None,
             pd,
             qp_list: Vec::new(),
             num_qps,
             family
         })
+    }
+    pub fn create_metadata(&mut self) -> anyhow::Result<()> {
+        let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
+        let sender_metadata_mr = IbvMr::new(self.pd.clone(), &self.sender_metadata, MrMetadata::SIZE, access_flags);
+        self.sender_metadata_mr = Some(sender_metadata_mr.clone());
+        self.sender_metadata.address = sender_metadata_mr.addr();
+        self.sender_metadata.rkey = sender_metadata_mr.rkey();
+        Ok(())
     }
     pub fn get_sender_metadata(&self) -> MrMetadata {
         self.sender_metadata.clone()
@@ -49,10 +57,10 @@ impl Sender {
         self.sender_metadata.length = length;
     }
     pub fn metadata_addr(&self) -> u64 {
-        self.sender_metadata_mr.addr()
+        self.sender_metadata_mr.as_ref().unwrap().addr()
     }
     pub fn metadata_lkey(&self) -> u32 {
-        self.sender_metadata_mr.lkey()
+        self.sender_metadata_mr.as_ref().unwrap().lkey()
     }
     pub fn pd(&self) -> Arc<IbvPd> {
         Arc::clone(&self.pd)
@@ -66,8 +74,9 @@ impl Sender {
         };
         let mut stream = TcpStream::connect(send_address).unwrap();
         let meta_data = MrMetadata{
-            address: self.sender_metadata_mr.addr(),
-            rkey: self.sender_metadata_mr.rkey(),
+            address: self.sender_metadata_mr.as_ref().unwrap().addr(),
+            rkey: self.sender_metadata_mr.as_ref().unwrap().rkey(),
+            padding: 0,
             length: 0,
         };
         let socket_comm = SocketComm{
