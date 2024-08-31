@@ -1,3 +1,5 @@
+use std::ffi::c_void;
+
 use ibverbs_rs::{sender::Sender, Family, IbvAccessFlags, IbvMr, IbvRecvWr, IbvSendWr, IbvSendWrList, IbvWcOpcode, IbvWrOpcode, LookUpBy, MrMetadata, QpMode, SendRecv};
 use clap::Parser;
 
@@ -32,15 +34,16 @@ fn main() -> anyhow::Result<()> {
 
     let message: [u8;65537*11] = [1;65537*11]; 
     let flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
-    let message_mr = IbvMr::new(sender.pd(), &message, message.len(), flags);
+    let addr = &message as *const u8 as *mut c_void;
+    let message_mr = IbvMr::new(sender.pd(), addr, message.len(), flags);
     let new_mr_metadata = MrMetadata{
         address: message_mr.addr(),
         rkey: message_mr.rkey(),
         padding: 0,
         length: message.len() as u64,
     };
-
-    let metadata_mr = IbvMr::new(sender.pd(), &new_mr_metadata, MrMetadata::SIZE, flags);
+    let addr = &new_mr_metadata as *const MrMetadata as *mut c_void;
+    let metadata_mr = IbvMr::new(sender.pd(), addr, MrMetadata::SIZE, flags);
     let send_wr = IbvSendWr::new(
         &metadata_mr,
         sender.receiver_metadata_address,

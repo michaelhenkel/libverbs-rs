@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, ptr::{self, null_mut}, sync::Arc};
+use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -7,7 +7,7 @@ use env_logger::Env;
 
 static INIT: Once = Once::new();
 const BATCH_SIZE: usize = 2000;
-const MAX_MESSAGE_SIZE: u64 = 128 * 1024;
+const MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 pub fn initialize_logger() {
     INIT.call_once(|| {
         env_logger::Builder::from_env(Env::default().default_filter_or("info"))
@@ -19,6 +19,7 @@ pub fn initialize_logger() {
 pub mod sender;
 pub mod receiver;
 
+#[derive(Clone)]
 pub enum QpMode{
     Single,
     Multi,
@@ -55,8 +56,8 @@ impl IbvQp{
             recv_cq: recv_cq.as_ptr(),
             srq: null_mut(),
             cap: ibv_qp_cap {
-                max_send_wr: 100,
-                max_recv_wr: 100,
+                max_send_wr: 4096,
+                max_recv_wr: 4096,
                 max_send_sge: 15,
                 max_recv_sge: 15,
                 max_inline_data: 64,
@@ -141,6 +142,7 @@ impl IbvQp{
         qp_attr.ah_attr.is_global = 1;
         qp_attr.ah_attr.grh.sgid_index = gidx as u8;
         qp_attr.ah_attr.grh.hop_limit = 10;
+        qp_attr.ah_attr.grh.flow_label = 666;
         let qp_attr_mask = 
             ibv_qp_attr_mask::IBV_QP_STATE |
             ibv_qp_attr_mask::IBV_QP_AV |
@@ -452,7 +454,7 @@ impl Drop for IbvPd{
 
 unsafe impl Send for IbvPd{}
 unsafe impl Sync for IbvPd{}
-
+#[derive(Clone)]
 pub struct IbvGid{
     inner: ibv_gid,
 }
@@ -467,7 +469,7 @@ impl IbvGid{
 
 unsafe impl Send for IbvGid{}
 unsafe impl Sync for IbvGid{}
-
+#[derive(Clone)]
 pub struct IbvDevice{
     inner: Box<*mut ibv_device>,
     gid_table: GidTable,
@@ -479,6 +481,7 @@ impl IbvDevice{
         let (device, context, gid_table) = device_lookup(look_up_by)?;
         let context = Arc::new(IbvContext::from_context(context));
         let inner = Box::new(device);
+        println!("Device created");
         Ok(IbvDevice{
             inner,
             gid_table,
@@ -494,8 +497,18 @@ impl IbvDevice{
     pub fn context(&self) -> Arc<IbvContext>{
         Arc::clone(&self.context)
     }
+    /*
     pub fn destroy(&self){
         unsafe{ ibv_close_device(self.context.as_ptr()) };
+    }
+    */
+}
+
+impl Drop for IbvDevice {
+    fn drop(&mut self) {
+        println!("Dropping IbvDevice");
+        //unsafe { ibv_close_device(self.context.as_ptr()) };
+        // Do not free `self.inner` because it's not owned by Rust's allocator
     }
 }
 
@@ -657,7 +670,7 @@ pub fn gid_to_ipv6_string(gid: ibv_gid) -> Option<std::net::Ipv6Addr> {
     }
 }
 
-
+#[derive(Clone)]
 pub struct GidTable{
     pub v4_table: BTreeMap<Ipv4Addr, GidEntry>,
     pub v6_table: BTreeMap<Ipv6Addr, GidEntry>,
@@ -729,7 +742,7 @@ impl GidTable{
         }
     }
 }
-
+#[derive(Clone)]
 pub struct GidEntry{
     gid: IbvGid,
     port: u8,
@@ -811,8 +824,7 @@ pub struct IbvMr{
 }
 
 impl IbvMr{
-    pub fn new<T>(pd: Arc<IbvPd>, t: &T, length: usize, access: i32) -> Self{
-        let addr = t as *const T as *mut c_void;
+    pub fn new(pd: Arc<IbvPd>, addr: *mut c_void, length: usize, access: i32) -> Self{
         let mr = unsafe{ ibv_reg_mr(pd.as_ptr(), addr, length, access) };
         let _addr = unsafe { (*mr).addr };
         let _rkey = unsafe { (*mr).rkey };
@@ -1246,18 +1258,56 @@ pub enum Hints{
 }
 #[repr(C)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MrMetadata{
-    pub address: u64,
-    pub rkey: u32,
-    pub padding: u32,
+pub struct ControlBufferMetadata{
+    pub in_address: u64,
+    pub in_rkey: u32,
+    pub out_address: u64,
+    pub out_rkey: u32,
     pub length: u64,
+    pub nreq: u64,
+    pub receiver_id: u32,
+    pub connection_id: u32,
 }
 
-impl MrMetadata{
-    pub const SIZE: usize = std::mem::size_of::<MrMetadata>();
+impl ControlBufferMetadata{
+    pub const SIZE: usize = std::mem::size_of::<ControlBufferMetadata>();
     pub fn addr(&self) -> *mut u8{
         &self as *const _ as *mut u8
     }
+}
+
+pub trait ControlBufferTrait{
+    fn length(&self) -> usize;
+    fn new() -> Pin<Box<dyn ControlBufferTrait>> where Self: Sized;
+    fn size() -> usize where Self: Sized;
+    fn address(&self) -> u64;
+}
+
+pub struct ControlBuffer{
+    in_buffer: InBuffer,
+    out_buffer: OutBuffer,
+}
+
+pub struct InBuffer{
+    local_addr: u64,
+    local_rkey: u32,
+    local_lkey: u32,
+    length: u64,
+    buffer: Pin<Box<dyn ControlBufferTrait>>,
+    remote_addr: u64,
+    remote_rkey: u32,
+    mr: Option<IbvMr>,
+}
+
+pub struct OutBuffer{
+    local_addr: u64,
+    local_rkey: u32,
+    local_lkey: u32,
+    length: u64,
+    buffer: Pin<Box<dyn ControlBufferTrait>>,
+    remote_addr: u64,
+    remote_rkey: u32,
+    mr: Option<IbvMr>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1275,7 +1325,7 @@ pub struct SocketComm{
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketCommCommand{
-    Mr(MrMetadata),
+    Mr(ControlBufferMetadata),
     InitQp(u32, Family),
     ConnectQp(QpMetadata),
     Continue,
