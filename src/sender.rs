@@ -1,6 +1,42 @@
-use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, sync::Arc};
-use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvWcOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand};
+use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, pin::Pin, sync::Arc, thread};
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvWcOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand, SLOT_COUNT};
 
+
+pub trait SenderInterface{
+    fn pd(&self) -> Arc<IbvPd>;
+    fn in_buffer_ptr(&self) -> *mut c_void;
+    fn out_buffer_ptr(&self) -> *mut c_void;
+    fn in_buffer_mr(&self) -> IbvMr;
+    fn out_buffer_mr(&self) -> IbvMr;
+    fn connection_id(&self) -> u32;
+    fn get_qp(&self, qp_idx: usize) -> IbvQp;
+}
+
+impl SenderInterface for Sender{
+    fn pd(&self) -> Arc<IbvPd> {
+        Arc::clone(&self.pd)
+    }
+    fn in_buffer_ptr(&self) -> *mut c_void {
+        let ptr: *mut () = &*self.control_buffer.in_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
+        ptr as *mut c_void
+    }
+    fn out_buffer_ptr(&self) -> *mut c_void {
+        let ptr = &*self.control_buffer.out_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
+        ptr as *mut c_void
+    }
+    fn in_buffer_mr(&self) -> IbvMr {
+        self.control_buffer.in_buffer.mr.as_ref().unwrap().clone()
+    }
+    fn out_buffer_mr(&self) -> IbvMr {
+        self.control_buffer.out_buffer.mr.as_ref().unwrap().clone()
+    }
+    fn connection_id(&self) -> u32 {
+        self.connection_id
+    }
+    fn get_qp(&self, qp_idx: usize) -> IbvQp {
+        self.qp_list[qp_idx].clone()
+    }
+}
 pub struct Sender{
     id: u32,
     connection_id: u32,
@@ -9,6 +45,7 @@ pub struct Sender{
     device: Box<IbvDevice>,
     receiver_socket_address: IpAddr,
     receiver_socket_port: u16,
+    mrs: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     num_qps: u32,
@@ -20,12 +57,14 @@ impl Sender {
     pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, receiver_socket_address: IpAddr, receiver_socket_port: u16, num_qps: u32, family: Family, qp_mode: QpMode) -> anyhow::Result<Sender> {
         let device = Box::new(IbvDevice::new(look_up_by)?);
         let pd = Arc::new(IbvPd::new(device.context()));
+        
+        let buffer_len = C::size() as u64;
         let control_buffer = ControlBuffer{
             in_buffer: InBuffer{
                 local_addr: 0,
                 local_rkey: 0,
                 local_lkey: 0,
-                length: 0,
+                length: buffer_len,
                 buffer: C::new(),
                 remote_addr: 0,
                 remote_rkey: 0,
@@ -35,13 +74,14 @@ impl Sender {
                 local_addr: 0,
                 local_rkey: 0,
                 local_lkey: 0,
-                length: 0,
+                length: buffer_len,
                 buffer: C::new(),
                 remote_addr: 0,
                 remote_rkey: 0,
                 mr: None,
             },
         };
+
         Ok(Sender{
             id: rand::random::<u32>(),
             control_buffer,
@@ -50,12 +90,19 @@ impl Sender {
             device,
             receiver_socket_address,
             receiver_socket_port,
+            mrs: 0,
             pd,
             qp_list: Vec::new(),
             num_qps,
             family,
             qp_mode,
         })
+    }
+    pub fn mrs(&self) -> u32 {
+        self.mrs
+    }
+    pub fn incr_mrs(&mut self) {
+        self.mrs += 1;
     }
     pub fn connection_id(&self) -> u32 {
         self.connection_id
@@ -75,22 +122,24 @@ impl Sender {
     pub fn create_control_buffer(&mut self) -> anyhow::Result<()> {
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
         let in_buffer_addr = self.in_buffer_ptr();
-        println!("in_buffer_addr: {:?}", in_buffer_addr);
-        let in_buffer_length = self.control_buffer.in_buffer.buffer.length();
-        let in_buffer_mr = IbvMr::new(self.pd.clone(), in_buffer_addr, in_buffer_length as usize, access_flags);
+        //let in_buffer_length = self.control_buffer.in_buffer.length as usize;
+        let in_buffer_mr = IbvMr::new(self.pd.clone(), in_buffer_addr, self.control_buffer.in_buffer.length as usize, access_flags);
         self.control_buffer.in_buffer.local_addr = in_buffer_mr.addr();
         self.control_buffer.in_buffer.local_rkey = in_buffer_mr.rkey();
         self.control_buffer.in_buffer.local_lkey = in_buffer_mr.lkey();
         self.control_buffer.in_buffer.mr = Some(in_buffer_mr);
 
         let out_buffer_addr = self.out_buffer_ptr();
-        let out_buffer_length = self.control_buffer.out_buffer.buffer.length();
-        let out_buffer_mr = IbvMr::new(self.pd.clone(), out_buffer_addr, out_buffer_length as usize, access_flags);
+        //let out_buffer_length = self.control_buffer.out_buffer.length as usize;
+        let out_buffer_mr = IbvMr::new(self.pd.clone(), out_buffer_addr, self.control_buffer.out_buffer.length as usize, access_flags);
         self.control_buffer.out_buffer.local_addr = out_buffer_mr.addr();
         self.control_buffer.out_buffer.local_rkey = out_buffer_mr.rkey();
         self.control_buffer.out_buffer.local_lkey = out_buffer_mr.lkey();
         self.control_buffer.out_buffer.mr = Some(out_buffer_mr);
         Ok(())
+    }
+    pub fn reset_nreqs(&mut self) {
+        self.number_of_requests = 0;
     }
     pub fn pd(&self) -> Arc<IbvPd> {
         Arc::clone(&self.pd)
@@ -105,7 +154,7 @@ impl Sender {
         self.control_buffer.out_buffer.remote_rkey
     }
     pub fn out_buffer_ptr(&self) -> *mut c_void {
-        let ptr: *mut () = &*self.control_buffer.out_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
+        let ptr = &*self.control_buffer.out_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
         ptr as *mut c_void
     }
     pub fn in_buffer_mr(&self) -> IbvMr {
@@ -131,7 +180,16 @@ impl Sender {
         } else {
             format!("[{}]:{}", self.receiver_socket_address, self.receiver_socket_port)
         };
-        let mut stream = TcpStream::connect(send_address).unwrap();
+        println!("Connecting to receiver: {}", send_address);
+        let mut stream = match TcpStream::connect(send_address.clone()){
+            Ok(stream) => stream,
+            Err(e) => {
+                println!("Failed to connect to receiver: {:?} {}", e, send_address);
+                return Err(anyhow::anyhow!("Failed to connect to receiver: {:?}", e));
+            }
+        };
+        println!("Connected to receiver: {}", send_address);
+    
 
         let control_buffer_metadata = ControlBufferMetadata{
             in_address: self.control_buffer.in_buffer.local_addr,
@@ -157,6 +215,7 @@ impl Sender {
             self.control_buffer.in_buffer.remote_rkey = control_buffer_metadata.in_rkey;
             self.control_buffer.out_buffer.remote_addr = control_buffer_metadata.out_address;
             self.control_buffer.out_buffer.remote_rkey = control_buffer_metadata.out_rkey;
+            self.connection_id = control_buffer_metadata.connection_id;
         }
         for qp_idx in 0..self.num_qps {
             let gid_idx = match self.qp_mode {
@@ -204,12 +263,11 @@ impl Sender {
         let serialized = bincode::serialize(&socket_comm).unwrap();
         stream.write(&serialized).unwrap();
         
+        /*/
         for qp in &self.qp_list{
             let notify_wr = IbvRecvWr::new(&self.out_buffer_mr());
             qp.ibv_post_recv(notify_wr)?;
-            //qp.complete(1, IbvWcOpcode::Recv, SendRecv::Recv)?;
-        }
-        
+        }*/     
         Ok(())
     }
     /* 

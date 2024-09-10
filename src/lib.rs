@@ -3,11 +3,14 @@ use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
 use env_logger::Env;
+use std::fmt::Debug;
 //use log::LevelFilter;
 
 static INIT: Once = Once::new();
 const BATCH_SIZE: usize = 2000;
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
+pub const SLOT_COUNT: usize = 256;
+
 pub fn initialize_logger() {
     INIT.call_once(|| {
         env_logger::Builder::from_env(Env::default().default_filter_or("info"))
@@ -38,28 +41,39 @@ pub struct IbvQp{
 impl IbvQp{
     pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8) -> Self{
         let comp_channel = Arc::new(IbvCompChannel::new(&context));
-        let recv_cq = Arc::new(IbvCq::new(context.clone(), 100, comp_channel.clone(), 0));
+        let recv_cq = Arc::new(IbvCq::new(&context, 4096, &comp_channel, 0));
+        
+        /*
         let ret = unsafe { ibv_req_notify_cq(recv_cq.as_ptr(), 0) };
         if ret != 0 {
-            panic!("Failed to request notify cq");
+          panic!("Failed to request notify cq");
         }
+        */
         
-        let send_cq = Arc::new(IbvCq::new(context.clone(), 100, comp_channel.clone(), 0));
+        
+        
+        let send_cq = Arc::clone(&recv_cq);
+        
+        
+        //let send_cq = Arc::new(IbvCq::new(&context, 50, &comp_channel, 0));
+        /*
         let ret = unsafe { ibv_req_notify_cq(send_cq.as_ptr(), 0) };
         if ret != 0 {
             panic!("Failed to request notify cq");
         }
+        */
+        
         
         let mut qp_init_attr = ibv_qp_init_attr {
             qp_context: null_mut(),
-            send_cq: send_cq.as_ptr(),
-            recv_cq: recv_cq.as_ptr(),
+            send_cq: recv_cq.as_ptr(),
+            recv_cq: send_cq.as_ptr(),
             srq: null_mut(),
             cap: ibv_qp_cap {
                 max_send_wr: 4096,
                 max_recv_wr: 4096,
-                max_send_sge: 15,
-                max_recv_sge: 15,
+                max_send_sge: 1,
+                max_recv_sge: 1,
                 max_inline_data: 64,
             },
             qp_type: ibv_qp_type::IBV_QPT_RC,
@@ -142,7 +156,7 @@ impl IbvQp{
         qp_attr.ah_attr.is_global = 1;
         qp_attr.ah_attr.grh.sgid_index = gidx as u8;
         qp_attr.ah_attr.grh.hop_limit = 10;
-        qp_attr.ah_attr.grh.flow_label = 666;
+        //qp_attr.ah_attr.grh.flow_label = 666;
         let qp_attr_mask = 
             ibv_qp_attr_mask::IBV_QP_STATE |
             ibv_qp_attr_mask::IBV_QP_AV |
@@ -156,7 +170,7 @@ impl IbvQp{
             return Err(anyhow::anyhow!("Failed to modify QP to RTR"));
         }
         qp_attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
-        qp_attr.timeout = 14;
+        qp_attr.timeout = 31;
         qp_attr.retry_cnt = 7;
         qp_attr.rnr_retry = 7;
         qp_attr.sq_psn = psn;
@@ -212,6 +226,29 @@ impl IbvQp{
         }
         Ok(())
     }
+    pub fn wait_for_send_event(&self) -> anyhow::Result<()>{
+        let event_channel = self.event_channel.as_ptr();
+        let mut cq = self.send_cq.as_ptr();
+        let mut context = null_mut();
+        let ret = unsafe{ ibv_get_cq_event(event_channel, &mut cq, &mut context) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Failed to get cq event"));
+        }
+        let ret = unsafe{ ibv_req_notify_cq(cq, 0) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Failed to request notify cq"));
+        }
+        let mut wc = unsafe { std::mem::zeroed::<ibv_wc>() };
+        let ret = unsafe{ ibv_poll_cq(cq, 1, &mut wc) };
+        if ret != 1 {
+            return Err(anyhow::anyhow!("Failed to poll cq"));
+        }
+        unsafe { ibv_ack_cq_events(self.send_cq().as_ptr(), 1) };
+        if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
+            return Err(anyhow::anyhow!("Failed to get success status"));
+        }
+        Ok(())
+    }
     pub fn state(&self) -> anyhow::Result<u32>{
         let state = unsafe{ (*self.as_ptr()).state };
         Ok(state)
@@ -219,62 +256,128 @@ impl IbvQp{
     pub fn destroy(&self){
         unsafe{ ibv_destroy_qp(self.as_ptr()) };
     }
-    pub fn complete(&self, iterations: usize, opcode_type: IbvWcOpcode, send_recv: SendRecv) -> anyhow::Result<()>{
-        let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(BATCH_SIZE);
+    pub fn poll_complete(&self, expected_completions: usize, opcode_type: IbvWcOpcode) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
+        //println!("getting cq");
+        let cq = self.recv_cq().as_ptr();
+        //println!("setting wc_vec");
+        let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(expected_completions);
+        let wc_ptr = wc_vec.as_mut_ptr();
+        let wc_done = unsafe { ibv_poll_cq(cq, expected_completions as i32, wc_ptr) };
+        if wc_done < 0 {
+            return Err(anyhow::anyhow!("Failed to poll cq"));
+        }
+        //println!("wc_done: {}", wc_done);
+        unsafe { wc_vec.set_len(wc_done as usize) };
+        //println!("setting wc_vec done");
+        let mut wr_id_list = Vec::new();
+        for i in 0..wc_done{
+            //println!("adding wc");
+            let wc = wc_ptr.wrapping_add(i as usize);
+            if wc.is_null(){
+                println!("wc is null");
+            }
+            let status = unsafe { (*wc).status };
+            let opcode = unsafe { (*wc).opcode };
+            let wr_id = unsafe { (*wc).wr_id };
+            let imm = if opcode == 129{
+                    let imm = unsafe { (*wc).imm_data_invalidated_rkey_union.imm_data };
+                    Some(imm)
+
+            } else {
+                None
+            };
+            
+            wr_id_list.push((wr_id, imm));
+            //println!("checking status");
+            if status != ibv_wc_status::IBV_WC_SUCCESS {
+                return Err(anyhow::anyhow!(format!("wc status {} wrong, expected {}", status, ibv_wc_status::IBV_WC_SUCCESS).to_string()));
+            }
+            //println!("done checking status");
+            /*
+            if opcode != opcode_type.as_i32() as u32{
+                return Err(anyhow::anyhow!(format!("wc opcode {} wrong, expected {}", opcode, opcode_type.as_i32()).to_string()));
+            }
+            println!("done checking opcode");
+            */
+            
+        }
+        //println!("returning complete2");
+        Ok((wc_done as usize, wr_id_list))
+    }
+    pub fn event_complete(&self, iterations: usize, opcode_type: IbvWcOpcode, batch_size: Option<usize>) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
+        let batch_size = match batch_size{
+            Some(size) => size,
+            None => BATCH_SIZE,
+        };
+        let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(batch_size);
         let wc_ptr = wc_vec.as_mut_ptr();
         let mut total_wc: i32 = 0;
         let mut context = ptr::null::<c_void>() as *mut _;
-        let nevents = 1;
         let solicited_only = 0;
-        let mut cq = match send_recv{
-            SendRecv::Send => {
-                self.send_cq().as_ptr()
-            },
-            SendRecv::Recv => {
-                self.recv_cq().as_ptr()
-            },
-        };
+        let mut cq = self.recv_cq().as_ptr();
         loop {
-            let ret = unsafe { ibv_poll_cq(cq, BATCH_SIZE as i32, wc_ptr.wrapping_add(total_wc as usize)) };
+            let ret = unsafe { ibv_poll_cq(cq, batch_size as i32, wc_ptr.wrapping_add(total_wc as usize)) };
             if ret < 0 {
                 return Err(anyhow::anyhow!("Failed to poll cq"));
             }
             total_wc += ret;
-            if total_wc >= iterations as i32{
+            if total_wc >= iterations as i32 {
                 break;
             }
-            let ret = unsafe { ibv_req_notify_cq(cq, solicited_only) };
-            if ret != 0 {
-                return Err(anyhow::anyhow!("Failed to request notify cq"));
+            if total_wc < iterations as i32 {
+                let ret = unsafe { ibv_req_notify_cq(cq, solicited_only) };
+                if ret != 0 {
+                    return Err(anyhow::anyhow!("Failed to request notify cq"));
+                }
+                let ret = unsafe { ibv_get_cq_event(self.event_channel().as_ptr(), &mut cq, &mut context) };
+                if ret != 0 {
+                    return Err(anyhow::anyhow!("Failed to get cq event"));
+                }
+                unsafe { ibv_ack_cq_events(self.recv_cq().as_ptr(), 1) };
+                let ret = unsafe { ibv_poll_cq(cq, batch_size as i32, wc_ptr.wrapping_add(total_wc as usize)) };
+                if ret < 0 {
+                    return Err(anyhow::anyhow!("Failed to poll cq"));
+                }
+                total_wc += ret;
+                if total_wc >= iterations as i32 {
+                    break;
+                }
             }
-            let ret = unsafe { ibv_poll_cq(cq, BATCH_SIZE as i32, wc_ptr.wrapping_add(total_wc as usize)) };
-            if ret < 0 {
-                return Err(anyhow::anyhow!("Failed to poll cq"));
-            }
-            total_wc += ret;
-            if total_wc >= iterations as i32{
-                break;
-            }
-            let ret = unsafe { ibv_get_cq_event(self.event_channel().as_ptr(), &mut cq, &mut context) };
-            if ret != 0 {
-                return Err(anyhow::anyhow!("Failed to get cq event"));
-            }
-            //assert!(cq == empty_cq && context as *mut rdma_cm_id == id.0);
-            //assert!(cq == empty_cq);
-            unsafe { ibv_ack_cq_events(self.recv_cq().as_ptr(), nevents) };
         }
+        let mut wr_id_list = Vec::new();
         for i in 0..total_wc{
             let wc = wc_ptr.wrapping_add(i as usize);
             let status = unsafe { (*wc).status };
             let opcode = unsafe { (*wc).opcode };
-            if status != ibv_wc_status::IBV_WC_SUCCESS || opcode != opcode_type.as_i32() as u32{
-                return Err(anyhow::anyhow!(format!("wc status/opcode {}/{} wrong, expected {}/{}", status, opcode, ibv_wc_status::IBV_WC_SUCCESS, opcode_type.as_i32()).to_string()));
+            let wr_id = unsafe { (*wc).wr_id };
+            let imm = match opcode_type{
+                IbvWcOpcode::RecvRdmaWithImm => {
+                    let imm = unsafe { (*wc).imm_data_invalidated_rkey_union.imm_data };
+                    Some(imm)
+                },
+                _ => { None }
+            };
+            wr_id_list.push((wr_id, imm));
+            if status != ibv_wc_status::IBV_WC_SUCCESS {
+                return Err(anyhow::anyhow!(format!("wc status {} wrong, expected {}", status, ibv_wc_status::IBV_WC_SUCCESS).to_string()));
             }
+            /*
+            if opcode != opcode_type.as_i32() as u32{
+                return Err(anyhow::anyhow!(format!("wc opcode {} wrong, expected {}", opcode, opcode_type.as_i32()).to_string()));
+            }
+            */
         }
-        Ok(())
+        Ok((total_wc as usize, wr_id_list))
     }
 }
 
+impl Debug for IbvQp{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IbvQp {{ qpn: {:?}, psn: {:?} }}", self.qp_num(), self.psn())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum SendRecv{
     Send,
     Recv,
@@ -359,7 +462,7 @@ pub struct IbvCq{
 }
 
 impl IbvCq{
-    pub fn new(context: Arc<IbvContext>, cqe: i32, channel: Arc<IbvCompChannel>, comp_vector: i32) -> Self{
+    pub fn new(context: &Arc<IbvContext>, cqe: i32, channel: &Arc<IbvCompChannel>, comp_vector: i32) -> Self{
         let cq = unsafe{ ibv_create_cq(context.as_ptr(), cqe, null_mut(), channel.as_ptr(), comp_vector) };
         let inner = Box::new(cq);
         IbvCq{
@@ -481,7 +584,6 @@ impl IbvDevice{
         let (device, context, gid_table) = device_lookup(look_up_by)?;
         let context = Arc::new(IbvContext::from_context(context));
         let inner = Box::new(device);
-        println!("Device created");
         Ok(IbvDevice{
             inner,
             gid_table,
@@ -506,7 +608,6 @@ impl IbvDevice{
 
 impl Drop for IbvDevice {
     fn drop(&mut self) {
-        println!("Dropping IbvDevice");
         //unsafe { ibv_close_device(self.context.as_ptr()) };
         // Do not free `self.inner` because it's not owned by Rust's allocator
     }
@@ -955,23 +1056,32 @@ pub struct IbvRecvWr{
 }
 
 impl IbvRecvWr{
-    pub fn new(mr: &IbvMr) -> Self{
-        let addr = mr.addr();
-        let length = mr.length();
-        let lkey = mr.lkey();
-        let sge = Box::new(ibv_sge {
-            addr,
-            length: length as u32,
-            lkey,
-        });
-
-        // Convert the Box into a raw pointer
-        let sge_ptr = Box::into_raw(sge);
+    pub fn new(mr: Option<&IbvMr>, wr_id: Option<u64>) -> Self{
         let mut wr: ibv_recv_wr = unsafe { std::mem::zeroed() };  // Create a zeroed ibv_recv_wr
-        wr.wr_id = 0;
-        wr.sg_list = sge_ptr;
+        wr.wr_id = wr_id.unwrap_or(0);
         wr.num_sge = 1;
-
+        if let Some(mr) = mr{
+            let addr = mr.addr();
+            let length = mr.length();
+            let lkey = mr.lkey();
+            let sge = Box::new(ibv_sge {
+                addr,
+                length: length as u32,
+                lkey,
+            });
+    
+            // Convert the Box into a raw pointer
+            let sge_ptr = Box::into_raw(sge);
+            wr.sg_list = sge_ptr;
+        } else {
+            let sge = Box::new(ibv_sge {
+                addr: 0,
+                length: 0,
+                lkey: 0,
+            });
+            let sge_ptr = Box::into_raw(sge);
+            wr.sg_list = sge_ptr;
+        }
         IbvRecvWr{
             inner: wr,
             next: None,
@@ -1067,14 +1177,24 @@ impl IbvSendWr{
         self.inner
     }
     pub fn new(
-        mr: &IbvMr,
-        mut remote_addr: u64,
+        local_addr: u64,
+        lkey: u32,
+        remote_addr: u64,
         rkey: u32,
+        size: u64,
+        offset: u64,
         opcode: IbvWrOpcode,
+        signaled: bool,
+        wr_id: Option<u64>,
+        last_wr_with_imm: bool,
     ) -> IbvSendWr {
-        let mut data_addr = mr.addr();
-        let length = mr.length() as u64;
-        let lkey = mr.lkey();
+        let mut local_addr = local_addr + offset;
+        let mut remote_addr = remote_addr + offset;
+        let mut _wr_id = match wr_id {
+            Some(wr_id) => wr_id,
+            None => local_addr,
+        };
+        let length = size;
         let mut last_wr: Option<*mut ibv_send_wr> = None;
         let mut first_wr = None;
         let mut remaining_volume = length;
@@ -1084,22 +1204,26 @@ impl IbvSendWr{
             let is_last_message = remaining_volume == message;
             
             let sge = Box::new(ibv_sge{
-                addr: data_addr,
+                addr: local_addr,
                 length: message as u32,
                 lkey,
             });
             let sge_ptr = Box::into_raw(sge);
             let mut wr = unsafe { std::mem::zeroed::<ibv_send_wr>() };
-            wr.wr_id = 0;
+            wr.wr_id = _wr_id;
             wr.sg_list = sge_ptr;
             wr.num_sge = 1;
             wr.opcode = opcode.get();
             wr.wr.rdma.remote_addr = remote_addr;
             wr.wr.rdma.rkey = rkey;
-            if is_last_message {
+            if is_last_message && signaled {
                 wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
             } else {
                 wr.send_flags = 0;
+            }
+            if is_last_message && last_wr_with_imm {
+                wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                wr.imm_data_invalidated_rkey_union.imm_data = length as u32;
             }
 
             let boxed_wr = Box::new(wr);
@@ -1115,7 +1239,13 @@ impl IbvSendWr{
             }
 
             last_wr = Some(boxed_wr_ptr);
-            data_addr += message as u64;
+            local_addr += message as u64;
+            match wr_id{
+                Some(_wr_id) => {},
+                None => {
+                    _wr_id += message as u64;
+                }
+            }
             remote_addr += message as u64;
             remaining_volume -= message;
         }
@@ -1128,6 +1258,7 @@ impl IbvSendWr{
 unsafe impl Send for IbvSendWr{}
 unsafe impl Sync for IbvSendWr{}
 
+#[derive(Clone)]
 pub enum IbvWrOpcode{
     RdmaWrite,
     RdmaWriteWithImm,
@@ -1164,7 +1295,7 @@ impl IbvWrOpcode{
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum IbvWcOpcode{
     Send = 0,
     RdmaWrite = 1,
@@ -1281,6 +1412,7 @@ pub trait ControlBufferTrait{
     fn new() -> Pin<Box<dyn ControlBufferTrait>> where Self: Sized;
     fn size() -> usize where Self: Sized;
     fn address(&self) -> u64;
+    fn print(&self);
 }
 
 pub struct ControlBuffer{
@@ -1367,4 +1499,71 @@ pub fn print_wr_ids(start: *mut ibv_send_wr) -> u64{
     println!("wr_id: {}, sge_addr: {}, sge_len: {}, remote_addr: {}, rkey {}, send_flag {}, opcode {}, srqn {}, sge_ptr_address {}",
         unsafe { (*current).wr_id }, sge_addr, sge_len, remote_addr, rkey, wr_send_flag, opcode, srqn, sge_ptr_address);
     total_len
+}
+
+pub fn debug_wr(start: *mut ibv_send_wr) -> WrsDebug{
+    let mut wrs_debug = WrsDebug{
+        wr_debugs: Vec::new(),
+    };
+    let mut current = start;
+    while !unsafe { (*current).next.is_null() } {
+        let sge = unsafe { (*current).sg_list };
+        let sge_len = unsafe { (*sge).length as u32 };
+        let sge_addr = unsafe { (*sge).addr };
+        let remote_addr = unsafe { (*current).wr.rdma.remote_addr };
+        let rkey = unsafe { (*current).wr.rdma.rkey };
+        let wr_send_flags = unsafe { (*current).send_flags };
+        let opcode = unsafe { (*current).opcode };
+        let srqn = unsafe { (*current).qp_type.xrc.remote_srqn };
+        let wr_debug = WrDebug{
+            wr_id: unsafe { (*current).wr_id },
+            sge_addr,
+            sge_len,
+            remote_addr,
+            rkey,
+            wr_send_flags,
+            opcode,
+            srqn,
+        };
+        wrs_debug.wr_debugs.push(wr_debug);
+        current = unsafe { (*current).next };
+    }
+    let sge = &unsafe { (*current).sg_list };
+    let sge_len = unsafe { (**sge).length as u32 };
+    let sge_addr = unsafe { (**sge).addr };
+    let remote_addr = unsafe { (*current).wr.rdma.remote_addr };
+    let rkey = unsafe { (*current).wr.rdma.rkey };
+    let wr_send_flags = unsafe { (*current).send_flags };
+    let opcode = unsafe { (*current).opcode };
+    let srqn = unsafe { (*current).qp_type.xrc.remote_srqn };
+    let wr_debug = WrDebug{
+        wr_id: unsafe { (*current).wr_id },
+        sge_addr,
+        sge_len,
+        remote_addr,
+        rkey,
+        wr_send_flags,
+        opcode,
+        srqn,
+    };
+    wrs_debug.wr_debugs.push(wr_debug);
+
+    wrs_debug
+}
+
+#[derive(Debug)]
+pub struct WrsDebug{
+    wr_debugs: Vec<WrDebug>,
+}
+
+#[derive(Debug)]
+struct WrDebug{
+    wr_id: u64,
+    sge_addr: u64,
+    sge_len: u32,
+    remote_addr: u64,
+    rkey: u32,
+    wr_send_flags: u32,
+    opcode: u32,
+    srqn: u32,
 }

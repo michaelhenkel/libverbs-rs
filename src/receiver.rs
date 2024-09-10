@@ -1,6 +1,51 @@
 use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, pin::{self, Pin}, sync::{Arc, Mutex}, thread::{self, JoinHandle}};
-use crate::{receiver, ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvWcOpcode, IbvWrOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand};
+use crate::{receiver, ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvWcOpcode, IbvWrOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand, SLOT_COUNT};
 
+pub trait ReceiverInterface {
+    fn accept(&mut self) -> anyhow::Result<()>;
+    fn in_buffer_ptr(&self) -> *mut c_void;
+    fn out_buffer_ptr(&self) -> *mut c_void;
+    fn in_buffer_mr(&self) -> IbvMr;
+    fn out_buffer_mr(&self) -> IbvMr;
+    fn connection_id(&self) -> u32;
+    fn pd(&self) -> Arc<IbvPd>;
+    fn get_qp(&self, idx: usize) -> IbvQp;
+    fn in_remote_buffer_addr(&self) -> u64;
+    fn in_remote_buffer_rkey(&self) -> u32;
+}
+
+impl ReceiverInterface for Receiver {
+    fn accept(&mut self) -> anyhow::Result<()> {
+        self.accept()
+    }
+    fn in_buffer_ptr(&self) -> *mut c_void {
+        self.in_buffer_ptr()
+    }
+    fn out_buffer_ptr(&self) -> *mut c_void {
+        self.out_buffer_ptr()
+    }
+    fn in_buffer_mr(&self) -> IbvMr {
+        self.in_buffer_mr()
+    }
+    fn out_buffer_mr(&self) -> IbvMr {
+        self.out_buffer_mr()
+    }
+    fn connection_id(&self) -> u32 {
+        self.connection_id()
+    }
+    fn pd(&self) -> Arc<IbvPd> {
+        self.pd()
+    }
+    fn get_qp(&self, idx: usize) -> IbvQp {
+        self.qp_list.get(idx).unwrap().clone()
+    }
+    fn in_remote_buffer_addr(&self) -> u64 {
+        self.in_remote_buffer_addr()
+    }
+    fn in_remote_buffer_rkey(&self) -> u32 {
+        self.in_remote_buffer_rkey()
+    }
+}
 pub struct Receiver{
     id: u32,
     connection_id: u32,
@@ -9,6 +54,7 @@ pub struct Receiver{
     device: IbvDevice,
     listen_socket_port: u16,
     listen_address: IpAddr,
+    mrs: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
     join_handle: Arc<Mutex<Option<JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>>,
@@ -23,12 +69,12 @@ impl Receiver {
             return Err(anyhow::anyhow!("Device context is null"));
         }
         let pd = Arc::new(IbvPd::new(device.context()));
-
+        let buffer_len = C::size() as u64;
         let in_buffer = InBuffer{
             local_addr: 0,
             local_rkey: 0,
             local_lkey: 0,
-            length: 0,
+            length: buffer_len,
             buffer: C::new(),
             remote_addr: 0,
             remote_rkey: 0,
@@ -42,7 +88,7 @@ impl Receiver {
             local_addr: 0,
             local_rkey: 0,
             local_lkey: 0,
-            length: 0,
+            length: buffer_len,
             buffer: C::new(),
             remote_addr: 0,
             remote_rkey: 0,
@@ -64,6 +110,7 @@ impl Receiver {
             device,
             listen_socket_port,
             listen_address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            mrs: 0,
             pd,
             qp_list: Vec::new(),
             join_handle: Arc::new(Mutex::new(None)),
@@ -71,6 +118,15 @@ impl Receiver {
             qp_mode,
         };
         Ok(receiver)
+    }
+    pub fn reset_nreqs(&mut self) {
+        self.number_of_requests = 0;
+    }
+    pub fn mrs(&self) -> u32 {
+        self.mrs
+    }
+    pub fn incr_mrs(&mut self) {
+        self.mrs += 1;
     }
     pub fn connection_id(&self) -> u32 {
         self.connection_id
@@ -123,7 +179,7 @@ impl Receiver {
 
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
         let in_buffer_addr = self.in_buffer_ptr();
-        let in_buffer_length = self.control_buffer.in_buffer.buffer.length();
+        let in_buffer_length = self.control_buffer.in_buffer.length;
         let in_buffer_mr = IbvMr::new(self.pd.clone(), in_buffer_addr, in_buffer_length as usize, access_flags);
         self.control_buffer.in_buffer.local_addr = in_buffer_mr.addr();
         self.control_buffer.in_buffer.local_rkey = in_buffer_mr.rkey();
@@ -132,7 +188,7 @@ impl Receiver {
 
 
         let out_buffer_addr = self.out_buffer_ptr();
-        let out_buffer_length = self.control_buffer.out_buffer.buffer.length();
+        let out_buffer_length = self.control_buffer.out_buffer.length;
         let out_buffer_mr = IbvMr::new(self.pd.clone(), out_buffer_addr, out_buffer_length as usize, access_flags);
         self.control_buffer.out_buffer.local_addr = out_buffer_mr.addr();
         self.control_buffer.out_buffer.local_rkey = out_buffer_mr.rkey();
@@ -164,7 +220,7 @@ impl Receiver {
             },
         };
         self.listen_address = address;
-        println!("Listening on address: {:?}", address);
+        println!("Listening on address: {:?}:{}", address, self.listen_socket_port);
 
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
@@ -256,15 +312,6 @@ impl Receiver {
         for (qp_idx, qp) in self.qp_list.iter().enumerate() {
             let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
             qp.connect(remote_qp_metadata)?;
-            let mr = self.out_buffer_mr();
-            let send_wr = IbvSendWr::new(
-                &mr,
-                self.control_buffer.out_buffer.remote_addr,
-                self.control_buffer.out_buffer.remote_rkey,
-                IbvWrOpcode::Send,
-            );
-            qp.ibv_post_send(send_wr.as_ptr())?;
-            qp.complete(1, IbvWcOpcode::Send, SendRecv::Send)?;
         }
         Ok(())
     }
