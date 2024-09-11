@@ -1,3 +1,4 @@
+use core::num;
 use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, pin::Pin, sync::Arc, thread};
 use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvWcOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand, SLOT_COUNT};
 
@@ -10,6 +11,8 @@ pub trait SenderInterface{
     fn out_buffer_mr(&self) -> IbvMr;
     fn connection_id(&self) -> u32;
     fn get_qp(&self, qp_idx: usize) -> IbvQp;
+    fn num_qps(&self) -> u32;
+    fn qps(&self) -> Vec<IbvQp>;
 }
 
 impl SenderInterface for Sender{
@@ -35,6 +38,12 @@ impl SenderInterface for Sender{
     }
     fn get_qp(&self, qp_idx: usize) -> IbvQp {
         self.qp_list[qp_idx].clone()
+    }
+    fn num_qps(&self) -> u32 {
+        self.num_qps
+    }
+    fn qps(&self) -> Vec<IbvQp> {
+        self.qp_list.clone()
     }
 }
 pub struct Sender{
@@ -97,6 +106,12 @@ impl Sender {
             family,
             qp_mode,
         })
+    }
+    pub fn num_qps(&self) -> u32 {
+        self.num_qps
+    }
+    pub fn qps(&self) -> Vec<IbvQp> {
+        self.qp_list.clone()
     }
     pub fn mrs(&self) -> u32 {
         self.mrs

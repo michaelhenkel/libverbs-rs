@@ -9,6 +9,8 @@ pub trait ReceiverInterface {
     fn out_buffer_mr(&self) -> IbvMr;
     fn connection_id(&self) -> u32;
     fn pd(&self) -> Arc<IbvPd>;
+    fn num_qps(&self) -> usize;
+    fn qp_list(&self) -> Vec<IbvQp>;
     fn get_qp(&self, idx: usize) -> IbvQp;
     fn in_remote_buffer_addr(&self) -> u64;
     fn in_remote_buffer_rkey(&self) -> u32;
@@ -17,6 +19,12 @@ pub trait ReceiverInterface {
 impl ReceiverInterface for Receiver {
     fn accept(&mut self) -> anyhow::Result<()> {
         self.accept()
+    }
+    fn num_qps(&self) -> usize {
+        self.qp_list.len()
+    }
+    fn qp_list(&self) -> Vec<IbvQp> {
+        self.qp_list.clone()
     }
     fn in_buffer_ptr(&self) -> *mut c_void {
         self.in_buffer_ptr()

@@ -1106,16 +1106,29 @@ unsafe impl Sync for IbvRecvWr{}
 pub struct IbvSendWrList(Vec<IbvSendWr>);
 impl IbvSendWrList{
     pub fn new(
-        mr: &IbvMr,
-        mut remote_addr: u64,
+        local_addr: u64,
+        lkey: u32,
+        remote_addr: u64,
         rkey: u32,
+        size: u64,
+        offset: u64,
+        opcode: IbvWrOpcode,
+        signaled: bool,
+        wr_id: Option<u64>,
+        last_wr_with_imm: bool,
         qps: u64,
-        opcode: IbvWrOpcode
     ) -> Self{
-        let volume_size = mr.length() as u64;
+        let local_addr = local_addr + offset;
+        let mut remote_addr = remote_addr + offset;
+        let mut _wr_id = match wr_id {
+            Some(wr_id) => wr_id,
+            None => local_addr,
+        };
+
+        let volume_size = size;
         let mut remaining_volume = volume_size;
-        let mut data_addr = mr.addr();
-        let lkey = mr.lkey();
+        let mut data_addr = local_addr;
+        let lkey = lkey;
         let mut wr_list = Vec::new();
         for i in 0..qps {
             let mut last_wr: *mut ibv_send_wr = ptr::null_mut();
@@ -1137,11 +1150,16 @@ impl IbvSendWrList{
                 wr.opcode = opcode.get();
                 wr.wr.rdma.remote_addr = remote_addr;
                 wr.wr.rdma.rkey = rkey;
-                if is_last_message_for_qp {
+                if is_last_message_for_qp && signaled {
                     wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
                 } else {
                     wr.send_flags = 0;
                 }
+                if is_last_message_for_qp && last_wr_with_imm {
+                    wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                    wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
+                }
+                wr.wr_id = _wr_id;
                 let wr = Box::new(wr);
                 let wr_ptr: *mut ibv_send_wr = Box::into_raw(wr);
                 if !last_wr.is_null() {
@@ -1166,6 +1184,9 @@ impl IbvSendWrList{
     }
     pub fn get(&self, index: usize) -> Option<&IbvSendWr>{
         self.0.get(index)
+    }
+    pub fn len(&self) -> usize{
+        self.0.len()
     }
 }
 
