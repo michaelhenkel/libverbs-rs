@@ -1,5 +1,5 @@
-use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, pin::{self, Pin}, sync::{Arc, Mutex}, thread::{self, JoinHandle}};
-use crate::{receiver, ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvSendWr, IbvWcOpcode, IbvWrOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand, SLOT_COUNT};
+use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, sync::{Arc, Mutex}, thread::{self, JoinHandle}};
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 pub trait ReceiverInterface {
     fn accept(&mut self) -> anyhow::Result<()>;
@@ -276,7 +276,7 @@ impl Receiver {
                         };
                         let gid_entry = device.gid_table.get_entry_by_index(gid_idx as usize, family.clone());
                         if let Some((_ip_addr, gid_entry)) = gid_entry{
-                            let qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port());
+                            let mut qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port());
                             qp.init(gid_entry.port).unwrap();
                             let qpn = qp.qp_num();
                             let psn = qp.psn();
@@ -317,7 +317,7 @@ impl Receiver {
         self.control_buffer.out_buffer.remote_addr = out_remote_address;
         self.control_buffer.out_buffer.remote_rkey = out_remote_key;
         self.qp_metadata_list = qp_metadata_list;
-        for (qp_idx, qp) in self.qp_list.iter().enumerate() {
+        for (qp_idx, qp) in self.qp_list.iter_mut().enumerate() {
             let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
             qp.connect(remote_qp_metadata)?;
         }

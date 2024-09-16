@@ -1,6 +1,5 @@
-use core::num;
-use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, pin::Pin, sync::Arc, thread};
-use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, IbvRecvWr, IbvWcOpcode, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SendRecv, SocketComm, SocketCommCommand, SLOT_COUNT};
+use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, sync::Arc};
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 
 pub trait SenderInterface{
@@ -9,6 +8,8 @@ pub trait SenderInterface{
     fn out_buffer_ptr(&self) -> *mut c_void;
     fn in_buffer_mr(&self) -> IbvMr;
     fn out_buffer_mr(&self) -> IbvMr;
+    fn in_remote_buffer_addr(&self) -> u64;
+    fn in_remote_buffer_rkey(&self) -> u32;
     fn connection_id(&self) -> u32;
     fn get_qp(&self, qp_idx: usize) -> IbvQp;
     fn num_qps(&self) -> u32;
@@ -26,6 +27,12 @@ impl SenderInterface for Sender{
     fn out_buffer_ptr(&self) -> *mut c_void {
         let ptr = &*self.control_buffer.out_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
         ptr as *mut c_void
+    }
+    fn in_remote_buffer_addr(&self) -> u64 {
+        self.control_buffer.in_buffer.remote_addr
+    }
+    fn in_remote_buffer_rkey(&self) -> u32 {
+        self.control_buffer.in_buffer.remote_rkey
     }
     fn in_buffer_mr(&self) -> IbvMr {
         self.control_buffer.in_buffer.mr.as_ref().unwrap().clone()
@@ -137,7 +144,6 @@ impl Sender {
     pub fn create_control_buffer(&mut self) -> anyhow::Result<()> {
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
         let in_buffer_addr = self.in_buffer_ptr();
-        //let in_buffer_length = self.control_buffer.in_buffer.length as usize;
         let in_buffer_mr = IbvMr::new(self.pd.clone(), in_buffer_addr, self.control_buffer.in_buffer.length as usize, access_flags);
         self.control_buffer.in_buffer.local_addr = in_buffer_mr.addr();
         self.control_buffer.in_buffer.local_rkey = in_buffer_mr.rkey();
@@ -145,7 +151,6 @@ impl Sender {
         self.control_buffer.in_buffer.mr = Some(in_buffer_mr);
 
         let out_buffer_addr = self.out_buffer_ptr();
-        //let out_buffer_length = self.control_buffer.out_buffer.length as usize;
         let out_buffer_mr = IbvMr::new(self.pd.clone(), out_buffer_addr, self.control_buffer.out_buffer.length as usize, access_flags);
         self.control_buffer.out_buffer.local_addr = out_buffer_mr.addr();
         self.control_buffer.out_buffer.local_rkey = out_buffer_mr.rkey();
@@ -189,13 +194,11 @@ impl Sender {
         ptr as *mut c_void
     }
     pub fn connect(&mut self) -> anyhow::Result<()> {
-        
         let send_address = if self.receiver_socket_address.is_ipv4() {
             format!("{}:{}", self.receiver_socket_address, self.receiver_socket_port)
         } else {
             format!("[{}]:{}", self.receiver_socket_address, self.receiver_socket_port)
         };
-        println!("Connecting to receiver: {}", send_address);
         let mut stream = match TcpStream::connect(send_address.clone()){
             Ok(stream) => stream,
             Err(e) => {
@@ -203,9 +206,6 @@ impl Sender {
                 return Err(anyhow::anyhow!("Failed to connect to receiver: {:?}", e));
             }
         };
-        println!("Connected to receiver: {}", send_address);
-    
-
         let control_buffer_metadata = ControlBufferMetadata{
             in_address: self.control_buffer.in_buffer.local_addr,
             in_rkey: self.control_buffer.in_buffer.local_rkey,
@@ -239,7 +239,7 @@ impl Sender {
             };
             let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, self.family.clone());
             if let Some((_ip_addr, gid_entry)) = gid_entry{
-                let qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port());
+                let mut qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port());
                 qp.init(gid_entry.port)?;
                 let socket_comm = SocketComm{
                     command: crate::SocketCommCommand::InitQp(qp_idx, self.family.clone()),

@@ -33,6 +33,8 @@ pub struct IbvQp{
     recv_cq: Arc<IbvCq>,
     send_cq: Arc<IbvCq>,
     event_channel: Arc<IbvCompChannel>,
+    rdma_port_num: u8,
+    remote_qp_metadata: Option<QpMetadata>,
     psn: u32,
     gidx: i32,
     port: u8,
@@ -42,28 +44,7 @@ impl IbvQp{
     pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8) -> Self{
         let comp_channel = Arc::new(IbvCompChannel::new(&context));
         let recv_cq = Arc::new(IbvCq::new(&context, 4096, &comp_channel, 0));
-        
-        /*
-        let ret = unsafe { ibv_req_notify_cq(recv_cq.as_ptr(), 0) };
-        if ret != 0 {
-          panic!("Failed to request notify cq");
-        }
-        */
-        
-        
-        
         let send_cq = Arc::clone(&recv_cq);
-        
-        
-        //let send_cq = Arc::new(IbvCq::new(&context, 50, &comp_channel, 0));
-        /*
-        let ret = unsafe { ibv_req_notify_cq(send_cq.as_ptr(), 0) };
-        if ret != 0 {
-            panic!("Failed to request notify cq");
-        }
-        */
-        
-        
         let mut qp_init_attr = ibv_qp_init_attr {
             qp_context: null_mut(),
             send_cq: recv_cq.as_ptr(),
@@ -87,6 +68,8 @@ impl IbvQp{
             recv_cq,
             send_cq,
             event_channel: comp_channel,
+            rdma_port_num: 0,
+            remote_qp_metadata: None,
             psn,
             gidx,
             port,
@@ -110,7 +93,7 @@ impl IbvQp{
     pub fn psn(&self) -> u32{
         self.psn
     }
-    pub fn init(&self, port: u8) -> anyhow::Result<()>{
+    pub fn init(&mut self, port: u8) -> anyhow::Result<()>{
         let mut qp_attr = unsafe { std::mem::zeroed::<ibv_qp_attr>() };
         qp_attr.qp_state = ibv_qp_state::IBV_QPS_INIT;
         qp_attr.pkey_index = 0;
@@ -121,9 +104,10 @@ impl IbvQp{
         if ret != 0 {
             return Err(anyhow::anyhow!("Failed to modify QP"));
         }
+        self.rdma_port_num = port;
         Ok(())
     }
-    pub fn connect(&self, remote_qp_metadata: &QpMetadata) -> anyhow::Result<()>{
+    pub fn connect(&mut self, remote_qp_metadata: &QpMetadata) -> anyhow::Result<()>{
         let remote_subnet_id = remote_qp_metadata.subnet_id;
         let remote_interface_id = remote_qp_metadata.interface_id;
         let subnet_prefix_bytes = remote_subnet_id.to_be_bytes();
@@ -147,7 +131,7 @@ impl IbvQp{
         qp_attr.dest_qp_num = remote_qpn;
         qp_attr.rq_psn = remote_psn;
         qp_attr.max_dest_rd_atomic = 1;
-        qp_attr.min_rnr_timer = 12;
+        qp_attr.min_rnr_timer = 7;
         qp_attr.ah_attr.sl = 0;
         qp_attr.ah_attr.src_path_bits = 0;
         qp_attr.ah_attr.port_num = port;
@@ -186,21 +170,45 @@ impl IbvQp{
         if ret != 0 {
             return Err(anyhow::anyhow!("Failed to modify QP to RTS"));
         }
+        self.remote_qp_metadata = Some(remote_qp_metadata.clone());
         Ok(())
     }
-    pub fn ibv_post_send(&self, send_wr: *mut ibv_send_wr) -> anyhow::Result<()>{
+    pub fn recover_qp(&mut self) -> anyhow::Result<()>{
+        println!("Recovering QP");
+        let mut qp_attr = unsafe { std::mem::zeroed::<ibv_qp_attr>() };
+        qp_attr.qp_state = ibv_qp_state::IBV_QPS_RESET;
+        let qp_attr_mask = ibv_qp_attr_mask::IBV_QP_STATE;
+        let ret = unsafe { ibv_modify_qp(self.as_ptr(), &mut qp_attr, qp_attr_mask.0 as i32) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Failed to modify QP to RESET"));
+        }
+        let port_num = self.rdma_port_num;
+        let remote_qp_metadata = self.remote_qp_metadata.as_ref().unwrap().clone();
+        self.init(port_num)?;
+        self.connect(&remote_qp_metadata)?;
+        Ok(())
+    }
+    pub fn ibv_post_send(&mut self, send_wr: *mut ibv_send_wr) -> anyhow::Result<()>{
         let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
         let ret = unsafe{ ibv_post_send(self.as_ptr(), send_wr, &mut bad_wr) };
         if ret != 0 {
-            return Err(anyhow::anyhow!("Failed to post send"));
+            if self.qp_error()? {
+                self.recover_qp()?;
+            } else {
+                return Err(anyhow::anyhow!("Failed to post send"));
+            }
         }
         Ok(())
     }
-    pub fn ibv_post_recv(&self, recv_wr: IbvRecvWr) -> anyhow::Result<()>{
+    pub fn ibv_post_recv(&mut self, recv_wr: IbvRecvWr) -> anyhow::Result<()>{
         let mut bad_wr: *mut ibv_recv_wr = ptr::null_mut();
         let ret = unsafe { ibv_post_recv(self.as_ptr(), recv_wr.as_ptr(), &mut bad_wr) };
         if ret != 0 {
-            println!("Error posting recv: {}", ret);
+            if self.qp_error()? {
+                self.recover_qp()?;
+            } else {
+                return Err(anyhow::anyhow!("Failed to post recv"));
+            }
         }
         Ok(())
     }
@@ -253,25 +261,32 @@ impl IbvQp{
         let state = unsafe{ (*self.as_ptr()).state };
         Ok(state)
     }
+    pub fn qp_error(&self) -> anyhow::Result<bool>{
+        let state = self.state()?;
+        if state == 6 {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+        
     pub fn destroy(&self){
         unsafe{ ibv_destroy_qp(self.as_ptr()) };
     }
-    pub fn poll_complete(&self, expected_completions: usize, opcode_type: IbvWcOpcode) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
-        //println!("getting cq");
+    pub fn poll_complete(&mut self, expected_completions: usize, _opcode_type: IbvWcOpcode) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
         let cq = self.recv_cq().as_ptr();
-        //println!("setting wc_vec");
         let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(expected_completions);
         let wc_ptr = wc_vec.as_mut_ptr();
         let wc_done = unsafe { ibv_poll_cq(cq, expected_completions as i32, wc_ptr) };
         if wc_done < 0 {
-            return Err(anyhow::anyhow!("Failed to poll cq"));
+            if self.qp_error()? {
+                self.recover_qp()?;
+            } else {
+                return Err(anyhow::anyhow!("Failed to poll cq"));
+            }
         }
-        //println!("wc_done: {}", wc_done);
         unsafe { wc_vec.set_len(wc_done as usize) };
-        //println!("setting wc_vec done");
         let mut wr_id_list = Vec::new();
         for i in 0..wc_done{
-            //println!("adding wc");
             let wc = wc_ptr.wrapping_add(i as usize);
             if wc.is_null(){
                 println!("wc is null");
@@ -288,20 +303,10 @@ impl IbvQp{
             };
             
             wr_id_list.push((wr_id, imm));
-            //println!("checking status");
             if status != ibv_wc_status::IBV_WC_SUCCESS {
                 return Err(anyhow::anyhow!(format!("wc status {} wrong, expected {}", status, ibv_wc_status::IBV_WC_SUCCESS).to_string()));
-            }
-            //println!("done checking status");
-            /*
-            if opcode != opcode_type.as_i32() as u32{
-                return Err(anyhow::anyhow!(format!("wc opcode {} wrong, expected {}", opcode, opcode_type.as_i32()).to_string()));
-            }
-            println!("done checking opcode");
-            */
-            
+            }  
         }
-        //println!("returning complete2");
         Ok((wc_done as usize, wr_id_list))
     }
     pub fn event_complete(&self, iterations: usize, opcode_type: IbvWcOpcode, batch_size: Option<usize>) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
@@ -348,7 +353,6 @@ impl IbvQp{
         for i in 0..total_wc{
             let wc = wc_ptr.wrapping_add(i as usize);
             let status = unsafe { (*wc).status };
-            let opcode = unsafe { (*wc).opcode };
             let wr_id = unsafe { (*wc).wr_id };
             let imm = match opcode_type{
                 IbvWcOpcode::RecvRdmaWithImm => {
@@ -361,11 +365,6 @@ impl IbvQp{
             if status != ibv_wc_status::IBV_WC_SUCCESS {
                 return Err(anyhow::anyhow!(format!("wc status {} wrong, expected {}", status, ibv_wc_status::IBV_WC_SUCCESS).to_string()));
             }
-            /*
-            if opcode != opcode_type.as_i32() as u32{
-                return Err(anyhow::anyhow!(format!("wc opcode {} wrong, expected {}", opcode, opcode_type.as_i32()).to_string()));
-            }
-            */
         }
         Ok((total_wc as usize, wr_id_list))
     }
@@ -1188,6 +1187,9 @@ impl IbvSendWrList{
     pub fn len(&self) -> usize{
         self.0.len()
     }
+    pub fn reverse(&mut self) {
+        self.0.reverse()
+    }
 }
 
 pub struct IbvSendWr{
@@ -1220,13 +1222,10 @@ impl IbvSendWr{
         let mut first_wr = None;
         let mut remaining_volume = length;
         let mut first = true;
-        while remaining_volume > 0 {
-            let message = remaining_volume.min(MAX_MESSAGE_SIZE);
-            let is_last_message = remaining_volume == message;
-            
+        if length == 0 {
             let sge = Box::new(ibv_sge{
                 addr: local_addr,
-                length: message as u32,
+                length: 0,
                 lkey,
             });
             let sge_ptr = Box::into_raw(sge);
@@ -1237,38 +1236,65 @@ impl IbvSendWr{
             wr.opcode = opcode.get();
             wr.wr.rdma.remote_addr = remote_addr;
             wr.wr.rdma.rkey = rkey;
-            if is_last_message && signaled {
+            if signaled {
                 wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
             } else {
                 wr.send_flags = 0;
             }
-            if is_last_message && last_wr_with_imm {
-                wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
-                wr.imm_data_invalidated_rkey_union.imm_data = length as u32;
-            }
-
             let boxed_wr = Box::new(wr);
             let boxed_wr_ptr = Box::into_raw(boxed_wr);
+            first_wr = Some(boxed_wr_ptr);
+        } else {
+            while remaining_volume > 0 {
+                let message = remaining_volume.min(MAX_MESSAGE_SIZE);
+                let is_last_message = remaining_volume == message;
 
-            if first {
-                first_wr = Some(boxed_wr_ptr);
-                first = false;
-            } else if let Some(last) = last_wr {
-                unsafe {
-                    (*last).next = boxed_wr_ptr; // Safely link the previous WR
+                let sge = Box::new(ibv_sge{
+                    addr: local_addr,
+                    length: message as u32,
+                    lkey,
+                });
+                let sge_ptr = Box::into_raw(sge);
+                let mut wr = unsafe { std::mem::zeroed::<ibv_send_wr>() };
+                wr.wr_id = _wr_id;
+                wr.sg_list = sge_ptr;
+                wr.num_sge = 1;
+                wr.opcode = opcode.get();
+                wr.wr.rdma.remote_addr = remote_addr;
+                wr.wr.rdma.rkey = rkey;
+                if is_last_message && signaled {
+                    wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
+                } else {
+                    wr.send_flags = 0;
                 }
-            }
+                if is_last_message && last_wr_with_imm {
+                    wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                    wr.imm_data_invalidated_rkey_union.imm_data = length as u32;
+                }
 
-            last_wr = Some(boxed_wr_ptr);
-            local_addr += message as u64;
-            match wr_id{
-                Some(_wr_id) => {},
-                None => {
-                    _wr_id += message as u64;
+                let boxed_wr = Box::new(wr);
+                let boxed_wr_ptr = Box::into_raw(boxed_wr);
+
+                if first {
+                    first_wr = Some(boxed_wr_ptr);
+                    first = false;
+                } else if let Some(last) = last_wr {
+                    unsafe {
+                        (*last).next = boxed_wr_ptr; // Safely link the previous WR
+                    }
                 }
+
+                last_wr = Some(boxed_wr_ptr);
+                local_addr += message as u64;
+                match wr_id{
+                    Some(_wr_id) => {},
+                    None => {
+                        _wr_id += message as u64;
+                    }
+                }
+                remote_addr += message as u64;
+                remaining_volume -= message;
             }
-            remote_addr += message as u64;
-            remaining_volume -= message;
         }
         IbvSendWr { 
             inner: first_wr.unwrap(),
@@ -1463,7 +1489,7 @@ pub struct OutBuffer{
     mr: Option<IbvMr>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct QpMetadata{
     pub subnet_id: u64,
     pub interface_id: u64,
@@ -1578,6 +1604,7 @@ pub struct WrsDebug{
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct WrDebug{
     wr_id: u64,
     sge_addr: u64,
@@ -1587,4 +1614,25 @@ struct WrDebug{
     wr_send_flags: u32,
     opcode: u32,
     srqn: u32,
+}
+
+pub trait Logger {
+    fn warn(&self, message: &str);
+    fn info(&self, message: &str);
+}
+
+#[macro_export]
+macro_rules! warn {
+    ($logger:expr, $($arg:tt)*) => {{
+        rust_warn!($($arg)*);
+        $logger.warn(&format!($($arg)*));
+    }};
+}
+
+#[macro_export]
+macro_rules! info {
+    ($logger:expr, $($arg:tt)*) => {{
+        rust_info!($($arg)*);
+        $logger.info(&format!($($arg)*));
+    }};
 }
