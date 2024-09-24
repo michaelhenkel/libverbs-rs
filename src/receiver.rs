@@ -1,7 +1,13 @@
-use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, sync::{Arc, Mutex}, thread::{self, JoinHandle}};
-use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
+use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc, Mutex}, thread::{self, JoinHandle}};
+use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
+
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 pub trait ReceiverInterface {
+    fn listen_address(&self) -> String;
+    fn qp_health_tracker(&self) -> Arc<AtomicU32>;
+    fn event_tracker(&self) -> anyhow::Result<()>;
+    fn device_healthy(&self) -> bool;
     fn accept(&mut self) -> anyhow::Result<()>;
     fn in_buffer_ptr(&self) -> *mut c_void;
     fn out_buffer_ptr(&self) -> *mut c_void;
@@ -10,20 +16,32 @@ pub trait ReceiverInterface {
     fn connection_id(&self) -> u32;
     fn pd(&self) -> Arc<IbvPd>;
     fn num_qps(&self) -> usize;
-    fn qp_list(&self) -> Vec<IbvQp>;
+    fn qp_list(&self) -> RefCell<Vec<IbvQp>>;
     fn get_qp(&self, idx: usize) -> IbvQp;
     fn in_remote_buffer_addr(&self) -> u64;
     fn in_remote_buffer_rkey(&self) -> u32;
 }
 
 impl ReceiverInterface for Receiver {
+    fn listen_address(&self) -> String {
+        self.listen_address()
+    }
+    fn qp_health_tracker(&self) -> Arc<AtomicU32> {
+        self.qp_health_tracker()
+    }
+    fn event_tracker(&self) -> anyhow::Result<()> {
+        self.event_tracker()
+    }
+    fn device_healthy(&self) -> bool {
+        self.device_healthy()
+    }
     fn accept(&mut self) -> anyhow::Result<()> {
         self.accept()
     }
     fn num_qps(&self) -> usize {
-        self.qp_list.len()
+        self.qp_list.borrow().len()
     }
-    fn qp_list(&self) -> Vec<IbvQp> {
+    fn qp_list(&self) -> RefCell<Vec<IbvQp>> {
         self.qp_list.clone()
     }
     fn in_buffer_ptr(&self) -> *mut c_void {
@@ -45,7 +63,7 @@ impl ReceiverInterface for Receiver {
         self.pd()
     }
     fn get_qp(&self, idx: usize) -> IbvQp {
-        self.qp_list.get(idx).unwrap().clone()
+        self.qp_list.borrow_mut().get(idx).unwrap().clone()
     }
     fn in_remote_buffer_addr(&self) -> u64 {
         self.in_remote_buffer_addr()
@@ -64,14 +82,16 @@ pub struct Receiver{
     listen_address: IpAddr,
     mrs: u32,
     pub pd: Arc<IbvPd>,
-    pub qp_list: Vec<IbvQp>,
+    pub qp_list: RefCell<Vec<IbvQp>>,
     join_handle: Arc<Mutex<Option<JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>>,
     qp_metadata_list: Vec<QpMetadata>,
     qp_mode: QpMode,
+    rate_limit: Option<u32>,
+    qp_health_tracker: Arc<AtomicU32>,
 }
 
 impl Receiver {
-    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode) -> anyhow::Result<Receiver> {
+    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode, rate_limit: Option<u32>) -> anyhow::Result<Receiver> {
         let device = IbvDevice::new(look_up_by)?;
         if device.context.as_ptr().is_null() {
             return Err(anyhow::anyhow!("Device context is null"));
@@ -88,10 +108,6 @@ impl Receiver {
             remote_rkey: 0,
             mr: None,
         };
-
-
-
-
         let out_buffer = OutBuffer{
             local_addr: 0,
             local_rkey: 0,
@@ -102,14 +118,10 @@ impl Receiver {
             remote_rkey: 0,
             mr: None,
         };
-
-
-
         let control_buffer = ControlBuffer{
             in_buffer,
             out_buffer,
         };
-
         let receiver = Receiver{
             id: rand::random::<u32>(),
             connection_id: rand::random::<u32>(),
@@ -120,10 +132,12 @@ impl Receiver {
             listen_address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             mrs: 0,
             pd,
-            qp_list: Vec::new(),
+            qp_list: RefCell::new(Vec::new()),
             join_handle: Arc::new(Mutex::new(None)),
             qp_metadata_list: Vec::new(),
             qp_mode,
+            rate_limit,
+            qp_health_tracker: Arc::new(AtomicU32::new(0)),
         };
         Ok(receiver)
     }
@@ -183,8 +197,10 @@ impl Receiver {
     pub fn dec_nreqs(&mut self) {
         self.number_of_requests -= 1;
     }
+    pub fn listen_address(&self) -> String {
+        format!("{:?}:{}", self.listen_address, self.listen_socket_port)
+    }
     pub fn create_control_buffer(&mut self) -> anyhow::Result<()> {
-
         let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
         let in_buffer_addr = self.in_buffer_ptr();
         let in_buffer_length = self.control_buffer.in_buffer.length;
@@ -228,7 +244,6 @@ impl Receiver {
             },
         };
         self.listen_address = address;
-        println!("Listening on address: {:?}:{}", address, self.listen_socket_port);
 
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
@@ -242,6 +257,7 @@ impl Receiver {
         let pd = self.pd();
         let qp_mode = self.qp_mode.clone();
         let receiver_id = self.get_id();
+        let rate_limit = self.rate_limit.clone();
         let jh: JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)> = thread::spawn(move || {
             let mut qp_list = Vec::new();
             let mut in_remote_address = 0;
@@ -275,8 +291,10 @@ impl Receiver {
                             QpMode::Single => {0}
                         };
                         let gid_entry = device.gid_table.get_entry_by_index(gid_idx as usize, family.clone());
-                        if let Some((_ip_addr, gid_entry)) = gid_entry{
-                            let mut qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port());
+                        if let Some((ip_addr, gid_entry)) = gid_entry{
+                            let mut qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port(), rate_limit);
+                            qp.local_gid = ip_addr.to_string();
+                            qp.hca_name = device.name.clone();
                             qp.init(gid_entry.port).unwrap();
                             let qpn = qp.qp_num();
                             let psn = qp.psn();
@@ -311,18 +329,94 @@ impl Receiver {
     pub fn accept(&mut self) -> anyhow::Result<()> {
         let jh = self.join_handle.lock().unwrap().take();
         let (qp_list, qp_metadata_list, in_remote_address, in_remote_key, out_remote_address, out_remote_key) = jh.unwrap().join().unwrap();
-        self.qp_list = qp_list;
+        self.qp_list = RefCell::new(qp_list);
         self.control_buffer.in_buffer.remote_addr = in_remote_address;
         self.control_buffer.in_buffer.remote_rkey = in_remote_key;
         self.control_buffer.out_buffer.remote_addr = out_remote_address;
         self.control_buffer.out_buffer.remote_rkey = out_remote_key;
         self.qp_metadata_list = qp_metadata_list;
-        for (qp_idx, qp) in self.qp_list.iter_mut().enumerate() {
+        for (qp_idx, qp) in self.qp_list.borrow_mut().iter_mut().enumerate() {
             let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
             qp.connect(remote_qp_metadata)?;
         }
         Ok(())
     }
+    pub fn event_tracker(&self) -> anyhow::Result<()> {
+        let context = self.device.context.clone();
+        let async_fd: RawFd = unsafe { (*(*context.inner)).async_fd };
+        let qp_list = self.qp_list.clone();
+        let qp_health_tracker = self.qp_health_tracker.clone();
+        std::thread::spawn(move || {
+            use libc::{poll, pollfd, POLLIN};
+            let mut fds = [pollfd {
+                fd: async_fd,
+                events: POLLIN,
+                revents: 0,
+            }];
+            loop {
+                let ret = unsafe { poll(fds.as_mut_ptr(), 1, -1) };
+                if ret < 0 {
+                    // Handle error
+                    eprintln!("Error polling async_fd");
+                    break;
+                }
+                if fds[0].revents & POLLIN != 0 {
+                    // An event is available
+                    let element = unsafe { std::mem::zeroed::<ibv_async_event_element_t>()};
+                    let event_type = unsafe { std::mem::zeroed::<ibv_event_type>()};
+                    let mut event = ibv_async_event {
+                        event_type,
+                        element,
+                    };
+                    let ret = unsafe { ibv_get_async_event(context.as_ptr(), &mut event) };
+                    if ret != 0 {
+                        // Handle error
+                        eprintln!("Error getting async event");
+                        break;
+                    }
+                    match event.event_type {
+                        ibv_event_type::IBV_EVENT_QP_FATAL |
+                        ibv_event_type::IBV_EVENT_QP_REQ_ERR |
+                        ibv_event_type::IBV_EVENT_QP_ACCESS_ERR => {
+                            // Check if the event is related to your QP
+                            for (qp_idx, qp) in qp_list.borrow_mut().iter().enumerate() {
+                                if unsafe { event.element.qp == qp.as_ptr() }{
+                                    println!("receiver QP {} event {:?} state: {:?}", qp_idx, IbvEventType::from(event.event_type), qp.state().unwrap());
+                                    qp_health_tracker.fetch_or(1 << qp_idx, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        },
+                        ibv_event_type::IBV_EVENT_PORT_ERR => {
+                            qp_health_tracker.fetch_or((1 << qp_list.borrow().len()) - 1, std::sync::atomic::Ordering::SeqCst);
+                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                                println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
+                            }
+                            println!("receiver received port error event");
+                        },
+                        ibv_event_type::IBV_EVENT_GID_CHANGE => {
+                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                                println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
+                            }
+                            println!("receiver received GID change event");
+                        },
+                        _ => {
+                            let et = IbvEventType::from(event.event_type);
+                            // Handle other events if necessary
+                            println!("receiver received good event {:?}", et);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+    pub fn qp_health_tracker(&self) -> Arc<AtomicU32> {
+        self.qp_health_tracker.clone()
+    }
+    pub fn device_healthy(&self) -> bool {
+        self.qp_health_tracker.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
 }
 
 fn socket_listener(listen_address: IpAddr, port: u16, out_tx: std::sync::mpsc::Sender<SocketCommCommand>, in_rx: std::sync::mpsc::Receiver<SocketCommCommand>) -> anyhow::Result<()>{

@@ -251,6 +251,7 @@ dependencies = [
  "bincode",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "rand",
  "rdma-sys",

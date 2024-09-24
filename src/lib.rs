@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, os::fd::RawFd, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -28,6 +28,7 @@ pub enum QpMode{
     Multi,
 }
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct IbvQp{
     inner: Box<*mut ibv_qp>,
     recv_cq: Arc<IbvCq>,
@@ -38,10 +39,15 @@ pub struct IbvQp{
     psn: u32,
     gidx: i32,
     port: u8,
+    rate_limit: Option<u32>,
+    context: Arc<IbvContext>,
+    local_gid: String,
+    remote_gid: String,
+    hca_name: String,
 }
 
 impl IbvQp{
-    pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8) -> Self{
+    pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8, rate_limit: Option<u32>) -> Self{
         let comp_channel = Arc::new(IbvCompChannel::new(&context));
         let recv_cq = Arc::new(IbvCq::new(&context, 4096, &comp_channel, 0));
         let send_cq = Arc::clone(&recv_cq);
@@ -73,7 +79,21 @@ impl IbvQp{
             psn,
             gidx,
             port,
+            rate_limit,
+            context,
+            local_gid: String::new(),
+            remote_gid: String::new(),
+            hca_name: String::new(),
         }
+    }
+    pub fn local_gid(&self) -> String{
+        self.local_gid.clone()
+    }
+    pub fn remote_gid(&self) -> String{
+        self.remote_gid.clone()
+    }
+    pub fn hca_name(&self) -> String{
+        self.hca_name.clone()
     }
     pub fn event_channel(&self) -> Arc<IbvCompChannel>{
         Arc::clone(&self.event_channel)
@@ -120,6 +140,8 @@ impl IbvQp{
         let remote_gid = ibv_gid{
             raw,
         };
+        let remote_address = gid_to_ipv6_string(remote_gid).unwrap();
+        self.remote_gid = remote_address.to_string();
         let remote_qpn = remote_qp_metadata.qpn;
         let remote_psn = remote_qp_metadata.psn;
         let psn = self.psn;
@@ -131,6 +153,7 @@ impl IbvQp{
         qp_attr.dest_qp_num = remote_qpn;
         qp_attr.rq_psn = remote_psn;
         qp_attr.max_dest_rd_atomic = 1;
+        qp_attr.timeout = 7;
         qp_attr.min_rnr_timer = 7;
         qp_attr.ah_attr.sl = 0;
         qp_attr.ah_attr.src_path_bits = 0;
@@ -154,7 +177,7 @@ impl IbvQp{
             return Err(anyhow::anyhow!("Failed to modify QP to RTR"));
         }
         qp_attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
-        qp_attr.timeout = 31;
+        qp_attr.timeout = 7;
         qp_attr.retry_cnt = 7;
         qp_attr.rnr_retry = 7;
         qp_attr.sq_psn = psn;
@@ -261,6 +284,15 @@ impl IbvQp{
         let state = unsafe{ (*self.as_ptr()).state };
         Ok(state)
     }
+    pub fn qp_attr(&self, qp_attr_mask: ibv_qp_attr_mask) -> anyhow::Result<ibv_qp_attr>{
+        let mut qp_attr = unsafe { std::mem::zeroed::<ibv_qp_attr>() };
+        let mut qp_init_attr = unsafe { std::mem::zeroed::<ibv_qp_init_attr>() };
+        let ret = unsafe { ibv_query_qp(self.as_ptr(), &mut qp_attr, qp_attr_mask.0 as i32, &mut qp_init_attr) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Failed to query QP"));
+        }
+        Ok(qp_attr)
+    }
     pub fn qp_error(&self) -> anyhow::Result<bool>{
         let state = self.state()?;
         if state == 6 {
@@ -272,7 +304,7 @@ impl IbvQp{
     pub fn destroy(&self){
         unsafe{ ibv_destroy_qp(self.as_ptr()) };
     }
-    pub fn poll_complete(&mut self, expected_completions: usize, _opcode_type: IbvWcOpcode) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
+    pub fn poll_complete(&mut self, expected_completions: usize, _opcode_type: IbvWcOpcode, func: Option<fn()>) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
         let cq = self.recv_cq().as_ptr();
         let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(expected_completions);
         let wc_ptr = wc_vec.as_mut_ptr();
@@ -309,6 +341,7 @@ impl IbvQp{
         }
         Ok((wc_done as usize, wr_id_list))
     }
+    
     pub fn event_complete(&self, iterations: usize, opcode_type: IbvWcOpcode, batch_size: Option<usize>) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
         let batch_size = match batch_size{
             Some(size) => size,
@@ -376,6 +409,8 @@ impl Debug for IbvQp{
     }
 }
 
+
+
 #[derive(Clone, Debug)]
 pub enum SendRecv{
     Send,
@@ -384,6 +419,76 @@ pub enum SendRecv{
 
 unsafe impl Send for IbvQp{}
 unsafe impl Sync for IbvQp{}
+
+pub struct IbvEventType(pub ibv_event_type);
+
+impl IbvEventType {
+    // Convert the event type to a human-readable string
+    pub fn to_str(&self) -> &'static str {
+        match self.0 {
+            ibv_event_type::IBV_EVENT_CQ_ERR => "Completion Queue Error",
+            ibv_event_type::IBV_EVENT_QP_FATAL => "Queue Pair Fatal Error",
+            ibv_event_type::IBV_EVENT_QP_REQ_ERR => "Queue Pair Request Error",
+            ibv_event_type::IBV_EVENT_QP_ACCESS_ERR => "Queue Pair Access Error",
+            ibv_event_type::IBV_EVENT_COMM_EST => "Communication Established",
+            ibv_event_type::IBV_EVENT_SQ_DRAINED => "Send Queue Drained",
+            ibv_event_type::IBV_EVENT_PATH_MIG => "Path Migration Successful",
+            ibv_event_type::IBV_EVENT_PATH_MIG_ERR => "Path Migration Error",
+            ibv_event_type::IBV_EVENT_DEVICE_FATAL => "Device Fatal Error",
+            ibv_event_type::IBV_EVENT_PORT_ACTIVE => "Port Active",
+            ibv_event_type::IBV_EVENT_PORT_ERR => "Port Error",
+            ibv_event_type::IBV_EVENT_LID_CHANGE => "LID Change",
+            ibv_event_type::IBV_EVENT_PKEY_CHANGE => "P_Key Change",
+            ibv_event_type::IBV_EVENT_SM_CHANGE => "SM Change",
+            ibv_event_type::IBV_EVENT_SRQ_ERR => "Shared Receive Queue Error",
+            ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED => "SRQ Limit Reached",
+            ibv_event_type::IBV_EVENT_QP_LAST_WQE_REACHED => "Last WQE Reached",
+            ibv_event_type::IBV_EVENT_CLIENT_REREGISTER => "Client Reregister",
+            ibv_event_type::IBV_EVENT_GID_CHANGE => "GID Table Change",
+            ibv_event_type::IBV_EVENT_WQ_FATAL => "Work Queue Fatal Error",
+        }
+    }
+
+    // Check if the event represents a fatal error
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self.0,
+            ibv_event_type::IBV_EVENT_QP_FATAL
+                | ibv_event_type::IBV_EVENT_DEVICE_FATAL
+                | ibv_event_type::IBV_EVENT_WQ_FATAL
+        )
+    }
+
+    // Example method: Check if the event is related to a QP
+    pub fn is_qp_related(&self) -> bool {
+        matches!(
+            self.0,
+            ibv_event_type::IBV_EVENT_QP_FATAL
+                | ibv_event_type::IBV_EVENT_QP_REQ_ERR
+                | ibv_event_type::IBV_EVENT_QP_ACCESS_ERR
+                | ibv_event_type::IBV_EVENT_QP_LAST_WQE_REACHED
+        )
+    }
+}
+
+// Implement From for easy conversion between ibv_event_type and IbvEventType
+impl From<ibv_event_type> for IbvEventType {
+    fn from(event: ibv_event_type) -> Self {
+        IbvEventType(event)
+    }
+}
+
+impl From<IbvEventType> for ibv_event_type {
+    fn from(wrapper: IbvEventType) -> Self {
+        wrapper.0
+    }
+}
+
+impl Debug for IbvEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IbvEventType({})", self.to_str())
+    }
+}
 
 pub struct IbvQpInitAttr{
     inner: ibv_qp_init_attr,
@@ -576,17 +681,19 @@ pub struct IbvDevice{
     inner: Box<*mut ibv_device>,
     gid_table: GidTable,
     context: Arc<IbvContext>,
+    name: String,
 }
 
 impl IbvDevice{
     pub fn new(look_up_by: LookUpBy) -> anyhow::Result<Self>{
-        let (device, context, gid_table) = device_lookup(look_up_by)?;
+        let (device, context, gid_table, name) = device_lookup(look_up_by)?;
         let context = Arc::new(IbvContext::from_context(context));
         let inner = Box::new(device);
         Ok(IbvDevice{
             inner,
             gid_table,
             context,
+            name,
         })
     }
     pub fn as_ptr(&self) -> *mut ibv_device {
@@ -621,7 +728,7 @@ pub enum LookUpBy{
     None,
 }
 
-fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut ibv_context, GidTable)>{
+fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut ibv_context, GidTable, String)>{
     let device_list: *mut *mut ibv_device = unsafe { ibv_get_device_list(null_mut()) };
     if device_list.is_null() {
         return Err(anyhow::anyhow!("No device found"));
@@ -641,18 +748,18 @@ fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut 
         match look_up_by{
             LookUpBy::Address(addr) => {
                 if gid_table.contains(addr){
-                    return Ok((device, context, gid_table));
+                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
                 }
             },
             LookUpBy::Name(ref name) => {
 
                 let name = name.as_str();
                 if name == device_name.to_str().unwrap(){
-                    return Ok((device, context, gid_table));
+                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
                 }
             },
             LookUpBy::None => {
-                return Ok((device, context, gid_table));
+                return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
             },
         }
         i += 1;
@@ -925,7 +1032,8 @@ pub struct IbvMr{
 
 impl IbvMr{
     pub fn new(pd: Arc<IbvPd>, addr: *mut c_void, length: usize, access: i32) -> Self{
-        let mr = unsafe{ ibv_reg_mr(pd.as_ptr(), addr, length, access) };
+        //let mr = unsafe{ ibv_reg_mr(pd.as_ptr(), addr, length, access) };
+        let mr = unsafe{ ibv_reg_mr_iova2(pd.as_ptr(), addr, length, addr as u64, access as u32) };
         let _addr = unsafe { (*mr).addr };
         let _rkey = unsafe { (*mr).rkey };
         let _lkey = unsafe { (*mr).lkey };
@@ -1210,6 +1318,7 @@ impl IbvSendWr{
         signaled: bool,
         wr_id: Option<u64>,
         last_wr_with_imm: bool,
+        inline: bool,
     ) -> IbvSendWr {
         let mut local_addr = local_addr + offset;
         let mut remote_addr = remote_addr + offset;
@@ -1240,6 +1349,9 @@ impl IbvSendWr{
                 wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
             } else {
                 wr.send_flags = 0;
+            }
+            if inline{
+                wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
             }
             let boxed_wr = Box::new(wr);
             let boxed_wr_ptr = Box::into_raw(boxed_wr);
@@ -1298,6 +1410,14 @@ impl IbvSendWr{
         }
         IbvSendWr { 
             inner: first_wr.unwrap(),
+        }
+    }
+}
+
+impl From<*mut ibv_send_wr> for IbvSendWr{
+    fn from(ptr: *mut ibv_send_wr) -> Self{
+        IbvSendWr{
+            inner: ptr,
         }
     }
 }
