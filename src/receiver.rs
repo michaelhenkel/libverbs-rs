@@ -1,7 +1,7 @@
 use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc, Mutex}, thread::{self, JoinHandle}};
 use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
 
-use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 pub trait ReceiverInterface {
     fn listen_address(&self) -> String;
@@ -88,10 +88,11 @@ pub struct Receiver{
     qp_mode: QpMode,
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
+    shared_cq: Option<Arc<IbvCq>>,
 }
 
 impl Receiver {
-    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode, rate_limit: Option<u32>) -> anyhow::Result<Receiver> {
+    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode, rate_limit: Option<u32>, shared_cq: bool) -> anyhow::Result<Receiver> {
         let device = IbvDevice::new(look_up_by)?;
         if device.context.as_ptr().is_null() {
             return Err(anyhow::anyhow!("Device context is null"));
@@ -122,6 +123,13 @@ impl Receiver {
             in_buffer,
             out_buffer,
         };
+        let cq = if shared_cq{
+            let comp_channel = Arc::new(IbvCompChannel::new(&device.context()));
+            let cq = Arc::new(IbvCq::new(&device.context, 4096, &comp_channel, 0));
+            Some(cq)
+        } else {
+            None
+        };
         let receiver = Receiver{
             id: rand::random::<u32>(),
             connection_id: rand::random::<u32>(),
@@ -138,6 +146,7 @@ impl Receiver {
             qp_mode,
             rate_limit,
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
+            shared_cq: cq,
         };
         Ok(receiver)
     }
@@ -257,6 +266,7 @@ impl Receiver {
         let pd = self.pd();
         let qp_mode = self.qp_mode.clone();
         let receiver_id = self.get_id();
+        let shared_cq = self.shared_cq.clone();
         let rate_limit = self.rate_limit.clone();
         let jh: JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)> = thread::spawn(move || {
             let mut qp_list = Vec::new();
@@ -292,7 +302,7 @@ impl Receiver {
                         };
                         let gid_entry = device.gid_table.get_entry_by_index(gid_idx as usize, family.clone());
                         if let Some((ip_addr, gid_entry)) = gid_entry{
-                            let mut qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port(), rate_limit);
+                            let mut qp = IbvQp::new(pd, device.context(), gid_entry.gidx(), gid_entry.port(), rate_limit, shared_cq.clone());
                             qp.local_gid = ip_addr.to_string();
                             qp.hca_name = device.name.clone();
                             qp.init(gid_entry.port).unwrap();

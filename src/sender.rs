@@ -1,7 +1,7 @@
 use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc}};
 use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event, ibv_qp_attr_mask};
 
-use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
+use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 
 pub trait SenderInterface{
@@ -79,10 +79,11 @@ pub struct Sender{
     qp_mode: QpMode,
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
+    shared_cq: Option<Arc<IbvCq>>,
 }
 
 impl Sender {
-    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, receiver_socket_address: IpAddr, receiver_socket_port: u16, num_qps: u32, family: Family, qp_mode: QpMode, rate_limit: Option<u32>) -> anyhow::Result<Sender> {
+    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, receiver_socket_address: IpAddr, receiver_socket_port: u16, num_qps: u32, family: Family, qp_mode: QpMode, rate_limit: Option<u32>, shared_cq: bool) -> anyhow::Result<Sender> {
         let device = Box::new(IbvDevice::new(look_up_by)?);
         let pd = Arc::new(IbvPd::new(device.context()));
         
@@ -109,6 +110,13 @@ impl Sender {
                 mr: None,
             },
         };
+        let cq = if shared_cq{
+            let comp_channel = Arc::new(IbvCompChannel::new(&device.context()));
+            let cq = Arc::new(IbvCq::new(&device.context, 4096, &comp_channel, 0));
+            Some(cq)
+        } else {
+            None
+        };
 
         Ok(Sender{
             id: rand::random::<u32>(),
@@ -126,6 +134,7 @@ impl Sender {
             qp_mode,
             rate_limit,
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
+            shared_cq: cq,
         })
     }
     pub fn num_qps(&self) -> u32 {
@@ -253,7 +262,7 @@ impl Sender {
             };
             let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, self.family.clone());
             if let Some((ip_addr, gid_entry)) = gid_entry{
-                let mut qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port(), self.rate_limit);
+                let mut qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port(), self.rate_limit, self.shared_cq.clone());
                 qp.local_gid = ip_addr.to_string();
                 qp.hca_name = self.device.name.clone();
                 qp.init(gid_entry.port)?;

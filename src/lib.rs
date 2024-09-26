@@ -47,9 +47,13 @@ pub struct IbvQp{
 }
 
 impl IbvQp{
-    pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8, rate_limit: Option<u32>) -> Self{
+    pub fn new(pd: Arc<IbvPd>, context: Arc<IbvContext>, gidx: i32, port: u8, rate_limit: Option<u32>, cq: Option<Arc<IbvCq>>) -> Self{
         let comp_channel = Arc::new(IbvCompChannel::new(&context));
-        let recv_cq = Arc::new(IbvCq::new(&context, 4096, &comp_channel, 0));
+        let recv_cq = if let Some(cq) = cq{
+            cq
+        } else {
+            Arc::new(IbvCq::new(&context, 4096, &comp_channel, 0))
+        };
         let send_cq = Arc::clone(&recv_cq);
         let mut qp_init_attr = ibv_qp_init_attr {
             qp_context: null_mut(),
@@ -409,6 +413,42 @@ impl Debug for IbvQp{
     }
 }
 
+impl Default for IbvQp {
+    fn default() -> Self {
+        let cq = unsafe { std::mem::zeroed::<ibv_cq>() };
+        let cq_ptr = &cq as *const _ as *mut _;
+        let ibv_cq = IbvCq{
+            inner: Box::new(cq_ptr),
+        };
+        let channel = unsafe { std::mem::zeroed::<ibv_comp_channel>() };
+        let channel_ptr = &channel as *const _ as *mut _;
+        let ibv_channel = IbvCompChannel{
+            inner: Box::new(channel_ptr),
+        };
+        let context = unsafe { std::mem::zeroed::<ibv_context>() };
+        let context_ptr = &context as *const _ as *mut _;
+        let ibv_context = IbvContext{
+            inner: Box::new(context_ptr),
+        };
+        IbvQp{
+            inner: Box::new(ptr::null_mut()),
+            recv_cq: Arc::new(ibv_cq.clone()),
+            send_cq: Arc::new(ibv_cq),
+            event_channel: Arc::new(ibv_channel),
+            rdma_port_num: 0,
+            remote_qp_metadata: None,
+            psn: 0,
+            gidx: 0,
+            port: 0,
+            rate_limit: None,
+            context: Arc::new(ibv_context),
+            local_gid: String::new(),
+            remote_gid: String::new(),
+            hca_name: String::new(),
+        }
+    }
+}
+
 
 
 #[derive(Clone, Debug)]
@@ -597,6 +637,17 @@ unsafe impl Sync for IbvCq{}
 
 pub struct IbvCompChannel{
     inner: Box<*mut ibv_comp_channel>,
+}
+
+impl Default for IbvCompChannel{
+    fn default() -> Self{
+        let channel = unsafe { std::mem::zeroed::<ibv_comp_channel>() };
+        let channel_ptr = &channel as *const _ as *mut _;
+        let inner = Box::new(channel_ptr);
+        IbvCompChannel{
+            inner,
+        }
+    }
 }
 
 impl IbvCompChannel{
@@ -985,6 +1036,14 @@ impl GidType{
 
 pub struct IbvContext{
     inner: Box<*mut ibv_context>,
+}
+
+impl Default for IbvContext{
+    fn default() -> Self{
+        IbvContext{
+            inner: Box::new(null_mut()),
+        }
+    }
 }
 
 impl IbvContext{
