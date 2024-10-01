@@ -16,7 +16,7 @@ pub trait ReceiverInterface {
     fn connection_id(&self) -> u32;
     fn pd(&self) -> Arc<IbvPd>;
     fn num_qps(&self) -> usize;
-    fn qp_list(&self) -> RefCell<Vec<IbvQp>>;
+    fn qp_list(&self) -> Vec<IbvQp>;
     fn get_qp(&self, idx: usize) -> IbvQp;
     fn in_remote_buffer_addr(&self) -> u64;
     fn in_remote_buffer_rkey(&self) -> u32;
@@ -39,9 +39,9 @@ impl ReceiverInterface for Receiver {
         self.accept()
     }
     fn num_qps(&self) -> usize {
-        self.qp_list.borrow().len()
+        self.qp_list.len()
     }
-    fn qp_list(&self) -> RefCell<Vec<IbvQp>> {
+    fn qp_list(&self) -> Vec<IbvQp> {
         self.qp_list.clone()
     }
     fn in_buffer_ptr(&self) -> *mut c_void {
@@ -63,7 +63,7 @@ impl ReceiverInterface for Receiver {
         self.pd()
     }
     fn get_qp(&self, idx: usize) -> IbvQp {
-        self.qp_list.borrow_mut().get(idx).unwrap().clone()
+        self.qp_list.get(idx).unwrap().clone()
     }
     fn in_remote_buffer_addr(&self) -> u64 {
         self.in_remote_buffer_addr()
@@ -82,7 +82,7 @@ pub struct Receiver{
     listen_address: IpAddr,
     mrs: u32,
     pub pd: Arc<IbvPd>,
-    pub qp_list: RefCell<Vec<IbvQp>>,
+    pub qp_list: Vec<IbvQp>,
     join_handle: Arc<Mutex<Option<JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>>,
     qp_metadata_list: Vec<QpMetadata>,
     qp_mode: QpMode,
@@ -140,7 +140,7 @@ impl Receiver {
             listen_address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             mrs: 0,
             pd,
-            qp_list: RefCell::new(Vec::new()),
+            qp_list: Vec::new(),
             join_handle: Arc::new(Mutex::new(None)),
             qp_metadata_list: Vec::new(),
             qp_mode,
@@ -339,13 +339,13 @@ impl Receiver {
     pub fn accept(&mut self) -> anyhow::Result<()> {
         let jh = self.join_handle.lock().unwrap().take();
         let (qp_list, qp_metadata_list, in_remote_address, in_remote_key, out_remote_address, out_remote_key) = jh.unwrap().join().unwrap();
-        self.qp_list = RefCell::new(qp_list);
+        self.qp_list = qp_list;
         self.control_buffer.in_buffer.remote_addr = in_remote_address;
         self.control_buffer.in_buffer.remote_rkey = in_remote_key;
         self.control_buffer.out_buffer.remote_addr = out_remote_address;
         self.control_buffer.out_buffer.remote_rkey = out_remote_key;
         self.qp_metadata_list = qp_metadata_list;
-        for (qp_idx, qp) in self.qp_list.borrow_mut().iter_mut().enumerate() {
+        for (qp_idx, qp) in self.qp_list.iter_mut().enumerate() {
             let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
             qp.connect(remote_qp_metadata)?;
         }
@@ -389,7 +389,7 @@ impl Receiver {
                         ibv_event_type::IBV_EVENT_QP_REQ_ERR |
                         ibv_event_type::IBV_EVENT_QP_ACCESS_ERR => {
                             // Check if the event is related to your QP
-                            for (qp_idx, qp) in qp_list.borrow_mut().iter().enumerate() {
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 if unsafe { event.element.qp == qp.as_ptr() }{
                                     println!("receiver QP {} event {:?} state: {:?}", qp_idx, IbvEventType::from(event.event_type), qp.state().unwrap());
                                     qp_health_tracker.fetch_or(1 << qp_idx, std::sync::atomic::Ordering::SeqCst);
@@ -397,14 +397,14 @@ impl Receiver {
                             }
                         },
                         ibv_event_type::IBV_EVENT_PORT_ERR => {
-                            qp_health_tracker.fetch_or((1 << qp_list.borrow().len()) - 1, std::sync::atomic::Ordering::SeqCst);
-                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                            qp_health_tracker.fetch_or((1 << qp_list.len()) - 1, std::sync::atomic::Ordering::SeqCst);
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
                             }
                             println!("receiver received port error event");
                         },
                         ibv_event_type::IBV_EVENT_GID_CHANGE => {
-                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
                             }
                             println!("receiver received GID change event");

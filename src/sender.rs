@@ -17,7 +17,7 @@ pub trait SenderInterface{
     fn connection_id(&self) -> u32;
     fn get_qp(&self, qp_idx: usize) -> IbvQp;
     fn num_qps(&self) -> u32;
-    fn qps(&self) -> RefCell<Vec<IbvQp>>;
+    fn qps(&self) -> Vec<IbvQp>;
 }
 
 impl SenderInterface for Sender{
@@ -54,12 +54,12 @@ impl SenderInterface for Sender{
         self.connection_id
     }
     fn get_qp(&self, qp_idx: usize) -> IbvQp {
-        self.qp_list.borrow_mut()[qp_idx].clone()
+        self.qp_list[qp_idx].clone()
     }
     fn num_qps(&self) -> u32 {
         self.num_qps
     }
-    fn qps(&self) -> RefCell<Vec<IbvQp>> {
+    fn qps(&self) -> Vec<IbvQp> {
         self.qp_list.clone()
     }
 }
@@ -73,7 +73,7 @@ pub struct Sender{
     receiver_socket_port: u16,
     mrs: u32,
     pub pd: Arc<IbvPd>,
-    pub qp_list: RefCell<Vec<IbvQp>>,
+    pub qp_list: Vec<IbvQp>,
     num_qps: u32,
     family: Family,
     qp_mode: QpMode,
@@ -128,7 +128,7 @@ impl Sender {
             receiver_socket_port,
             mrs: 0,
             pd,
-            qp_list: RefCell::new(Vec::new()),
+            qp_list: Vec::new(),
             num_qps,
             family,
             qp_mode,
@@ -140,7 +140,7 @@ impl Sender {
     pub fn num_qps(&self) -> u32 {
         self.num_qps
     }
-    pub fn qps(&self) -> RefCell<Vec<IbvQp>> {
+    pub fn qps(&self) -> Vec<IbvQp> {
         self.qp_list.clone()
     }
     pub fn mrs(&self) -> u32 {
@@ -287,7 +287,7 @@ impl Sender {
                         qpn,
                         psn
                     };
-                    self.qp_list.borrow_mut().push(qp);
+                    self.qp_list.push(qp);
                     let sock_comm = SocketComm{
                         command: crate::SocketCommCommand::ConnectQp(qp_metadata),
                     };
@@ -350,7 +350,7 @@ impl Sender {
                         ibv_event_type::IBV_EVENT_QP_REQ_ERR |
                         ibv_event_type::IBV_EVENT_QP_ACCESS_ERR => {
                             // Check if the event is related to your QP
-                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 if unsafe { event.element.qp == qp.as_ptr() }{
                                     println!("sender QP {} event {:?} state: {:?}", qp_idx, IbvEventType::from(event.event_type), qp.state().unwrap());
                                     qp_health_tracker.fetch_or(1 << qp_idx, std::sync::atomic::Ordering::SeqCst);
@@ -358,14 +358,14 @@ impl Sender {
                             }
                         },
                         ibv_event_type::IBV_EVENT_PORT_ERR => {
-                            qp_health_tracker.fetch_or((1 << qp_list.borrow().len()) - 1, std::sync::atomic::Ordering::SeqCst);
-                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                            qp_health_tracker.fetch_or((1 << qp_list.len()) - 1, std::sync::atomic::Ordering::SeqCst);
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 println!("sender QP {} state: {:?}", qp_idx, qp.state().unwrap());
                             }
                             println!("sender received port error event");
                         },
                         ibv_event_type::IBV_EVENT_GID_CHANGE => {
-                            for (qp_idx, qp) in qp_list.borrow().iter().enumerate() {
+                            for (qp_idx, qp) in qp_list.iter().enumerate() {
                                 println!("sender QP {} state: {:?}", qp_idx, qp.state().unwrap());
                             }
                             println!("sender received GID change event");
