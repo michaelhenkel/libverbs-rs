@@ -227,9 +227,9 @@ impl IbvQp{
         }
         Ok(())
     }
-    pub fn ibv_post_recv(&mut self, recv_wr: IbvRecvWr) -> anyhow::Result<()>{
+    pub fn ibv_post_recv(&mut self, recv_wr: *mut ibv_recv_wr) -> anyhow::Result<()>{
         let mut bad_wr: *mut ibv_recv_wr = ptr::null_mut();
-        let ret = unsafe { ibv_post_recv(self.as_ptr(), recv_wr.as_ptr(), &mut bad_wr) };
+        let ret = unsafe { ibv_post_recv(self.as_ptr(), recv_wr, &mut bad_wr) };
         if ret != 0 {
             if self.qp_error()? {
                 self.recover_qp()?;

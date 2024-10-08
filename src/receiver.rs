@@ -1,5 +1,6 @@
-use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc, Mutex}, thread::{self, JoinHandle}};
+use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, result, sync::{atomic::AtomicU32, mpsc, Arc, Mutex, RwLock}, thread::{self, JoinHandle}};
 use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
+use crossbeam::channel;
 
 use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
@@ -74,7 +75,7 @@ impl ReceiverInterface for Receiver {
 }
 pub struct Receiver{
     id: u32,
-    connection_id: u32,
+    pub connection_id: u32,
     control_buffer: ControlBuffer,
     number_of_requests: u64,
     device: IbvDevice,
@@ -83,12 +84,14 @@ pub struct Receiver{
     mrs: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
-    join_handle: Arc<Mutex<Option<JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>>,
+    join_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     qp_metadata_list: Vec<QpMetadata>,
     qp_mode: QpMode,
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
     shared_cq: Option<Arc<IbvCq>>,
+    pub result_recv: Arc<RwLock<channel::Receiver<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>,
+    pub result_send: channel::Sender<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>,
 }
 
 impl Receiver {
@@ -130,6 +133,7 @@ impl Receiver {
         } else {
             None
         };
+        let (result_send, result_recv) = channel::bounded(10);
         let receiver = Receiver{
             id: rand::random::<u32>(),
             connection_id: rand::random::<u32>(),
@@ -147,6 +151,8 @@ impl Receiver {
             rate_limit,
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
             shared_cq: cq,
+            result_recv: Arc::new(RwLock::new(result_recv)),
+            result_send,
         };
         Ok(receiver)
     }
@@ -253,7 +259,6 @@ impl Receiver {
             },
         };
         self.listen_address = address;
-
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
         socket_listener(address, self.listen_socket_port, out_tx, in_rx).map_err(|e| anyhow::anyhow!("Error creating listener thread: {:?}", e))?;
@@ -268,7 +273,8 @@ impl Receiver {
         let receiver_id = self.get_id();
         let shared_cq = self.shared_cq.clone();
         let rate_limit = self.rate_limit.clone();
-        let jh: JoinHandle<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)> = thread::spawn(move || {
+        let result_send = self.result_send.clone();
+        let jh: JoinHandle<()> = thread::spawn(move || {
             let mut qp_list = Vec::new();
             let mut in_remote_address = 0;
             let mut in_remote_rkey = 0;
@@ -331,14 +337,23 @@ impl Receiver {
                     SocketCommCommand::Continue => { continue; },
                 }
             }
-            (qp_list, qp_metadata_list, in_remote_address, in_remote_rkey, out_remote_address, out_remote_rkey)
+            let _ = result_send.send((qp_list, qp_metadata_list, in_remote_address, in_remote_rkey, out_remote_address, out_remote_rkey));
+            //(qp_list, qp_metadata_list, in_remote_address, in_remote_rkey, out_remote_address, out_remote_rkey)
         });
         self.join_handle = Arc::new(Mutex::new(Some(jh)));
         Ok(())
     }
     pub fn accept(&mut self) -> anyhow::Result<()> {
-        let jh = self.join_handle.lock().unwrap().take();
-        let (qp_list, qp_metadata_list, in_remote_address, in_remote_key, out_remote_address, out_remote_key) = jh.unwrap().join().unwrap();
+        let result_recv = self.result_recv.clone();
+        let result_recv = result_recv.read().unwrap();
+        let (qp_list, qp_metadata_list, in_remote_address, in_remote_key, out_remote_address, out_remote_key) = match result_recv.recv_timeout(std::time::Duration::from_micros(50)){
+            Ok(result) => {
+                result
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Error receiving result: {:?}", e));
+            }
+        };
         self.qp_list = qp_list;
         self.control_buffer.in_buffer.remote_addr = in_remote_address;
         self.control_buffer.in_buffer.remote_rkey = in_remote_key;
