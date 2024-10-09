@@ -15,4 +15,5 @@ libc = "0.2.158"
 log = "0.4.22"
 rand = "0.8.5"
 rdma-sys = { git = "https://github.com/michaelhenkel/rdma-sys" }
+lldpd_rs = { git = "https://github.com/michaelhenkel/lldpd-rs" }
 serde = { version = "1.0.209", features = ["derive", "serde_derive"] }

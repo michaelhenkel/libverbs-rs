@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, os::fd::RawFd, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -308,7 +308,7 @@ impl IbvQp{
     pub fn destroy(&self){
         unsafe{ ibv_destroy_qp(self.as_ptr()) };
     }
-    pub fn poll_complete(&mut self, expected_completions: usize, _opcode_type: IbvWcOpcode, func: Option<fn()>) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
+    pub fn poll_complete(&mut self, expected_completions: usize, _opcode_type: IbvWcOpcode) -> anyhow::Result<(usize, Vec<(u64, Option<u32>)>)>{
         let cq = self.recv_cq().as_ptr();
         let mut wc_vec: Vec<ibv_wc> = Vec::with_capacity(expected_completions);
         let wc_ptr = wc_vec.as_mut_ptr();
@@ -733,11 +733,12 @@ pub struct IbvDevice{
     gid_table: GidTable,
     context: Arc<IbvContext>,
     name: String,
+    kernel_name: String
 }
 
 impl IbvDevice{
     pub fn new(look_up_by: LookUpBy) -> anyhow::Result<Self>{
-        let (device, context, gid_table, name) = device_lookup(look_up_by)?;
+        let (device, context, gid_table, name, kernel_name) = device_lookup(look_up_by)?;
         let context = Arc::new(IbvContext::from_context(context));
         let inner = Box::new(device);
         Ok(IbvDevice{
@@ -745,6 +746,7 @@ impl IbvDevice{
             gid_table,
             context,
             name,
+            kernel_name,
         })
     }
     pub fn as_ptr(&self) -> *mut ibv_device {
@@ -755,6 +757,12 @@ impl IbvDevice{
     }
     pub fn context(&self) -> Arc<IbvContext>{
         Arc::clone(&self.context)
+    }
+    pub fn name(&self) -> String{
+        self.name.clone()
+    }
+    pub fn kernel_name(&self) -> String{
+        self.kernel_name.clone()
     }
     /*
     pub fn destroy(&self){
@@ -779,7 +787,25 @@ pub enum LookUpBy{
     None,
 }
 
-fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut ibv_context, GidTable, String)>{
+fn get_kernel_name(device_name: &str) -> anyhow::Result<String> {
+    let sysfs_path = format!("/sys/class/infiniband/{}/device/net", device_name);
+    match fs::read_dir(sysfs_path) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let iface_name = entry.file_name();
+                return Ok(iface_name.to_string_lossy().to_string());
+            }
+        }
+        Err(_) => {
+            println!("No associated network interface found for RDMA device: {}", device_name);
+            return Err(anyhow::anyhow!("Failed to get kernel name"))
+        }
+    }
+    Err(anyhow::anyhow!("Failed to get kernel name"))
+}
+
+fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut ibv_context, GidTable, String, String)>{
     let device_list: *mut *mut ibv_device = unsafe { ibv_get_device_list(null_mut()) };
     if device_list.is_null() {
         return Err(anyhow::anyhow!("No device found"));
@@ -799,18 +825,36 @@ fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut 
         match look_up_by{
             LookUpBy::Address(addr) => {
                 if gid_table.contains(addr){
-                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
+                    let kernel_name = match get_kernel_name(device_name.to_str().unwrap()){
+                        Ok(name) => name,
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Failed to get kernel name"));
+                        }
+                    };
+                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string(), kernel_name));
                 }
             },
             LookUpBy::Name(ref name) => {
 
                 let name = name.as_str();
                 if name == device_name.to_str().unwrap(){
-                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
+                    let kernel_name = match get_kernel_name(device_name.to_str().unwrap()){
+                        Ok(name) => name,
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Failed to get kernel name"));
+                        }
+                    };
+                    return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string(), kernel_name));
                 }
             },
             LookUpBy::None => {
-                return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string()));
+                let kernel_name = match get_kernel_name(device_name.to_str().unwrap()){
+                    Ok(name) => name,
+                    Err(_) => {
+                        return Err(anyhow::anyhow!("Failed to get kernel name"));
+                    }
+                };
+                return Ok((device, context, gid_table, device_name.to_str().unwrap().to_string(), kernel_name));
             },
         }
         i += 1;
@@ -1674,6 +1718,7 @@ pub struct QpMetadata{
     pub interface_id: u64,
     pub psn: u32,
     pub qpn: u32,
+    pub chassis_id: [u8; 6],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1690,14 +1735,11 @@ pub enum SocketCommCommand{
     Stop,
 }
 
-
-
 pub fn print_wr_ids(start: *mut ibv_send_wr) -> u64{
     let mut current = start;
     let mut total_len = 0;
     while !unsafe { (*current).next.is_null() } {
         let sge = unsafe { (*current).sg_list };
-        
         let sge_len = unsafe { (*sge).length as u64 };
         total_len += sge_len;
         let sge_addr = unsafe { (*sge).addr };
@@ -1710,7 +1752,6 @@ pub fn print_wr_ids(start: *mut ibv_send_wr) -> u64{
         println!("wr_id: {}, sge_addr: {}, sge_len: {}, remote_addr: {}, rkey {}, send_flag {}, opcode {}, srqn {}, sge_ptr_address {}",
             unsafe { (*current).wr_id }, sge_addr, sge_len, remote_addr, rkey, wr_send_flag, opcode, srqn, sge_ptr_address);
         current = unsafe { (*current).next };
-
     }
     let sge = &unsafe { (*current).sg_list };
     let sge_len = unsafe { (**sge).length as u64 };

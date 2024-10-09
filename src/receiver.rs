@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, result, sync::{atomic::AtomicU32, mpsc, Arc, Mutex, RwLock}, thread::{self, JoinHandle}};
+use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}, thread::{self, JoinHandle}};
 use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
 use crossbeam::channel;
 
@@ -21,6 +21,7 @@ pub trait ReceiverInterface {
     fn get_qp(&self, idx: usize) -> IbvQp;
     fn in_remote_buffer_addr(&self) -> u64;
     fn in_remote_buffer_rkey(&self) -> u32;
+    fn device(&self) -> IbvDevice;
 }
 
 impl ReceiverInterface for Receiver {
@@ -71,6 +72,9 @@ impl ReceiverInterface for Receiver {
     }
     fn in_remote_buffer_rkey(&self) -> u32 {
         self.in_remote_buffer_rkey()
+    }
+    fn device(&self) -> IbvDevice {
+        self.device.clone()
     }
 }
 pub struct Receiver{
@@ -274,6 +278,24 @@ impl Receiver {
         let shared_cq = self.shared_cq.clone();
         let rate_limit = self.rate_limit.clone();
         let result_send = self.result_send.clone();
+        let chassis_id = lldpd_rs::get_remote_chassis_id(&device.kernel_name);
+        let chassis_id = match chassis_id{
+            Some(chassis_id) => {
+                let parts: Vec<&str> = chassis_id.split(':').collect();
+                if parts.len() == 6 {
+                    let mut chassis_id = [0; 6];
+                    for (idx, part) in parts.iter().enumerate() {
+                        chassis_id[idx] = u8::from_str_radix(part, 16).unwrap();
+                    }
+                    chassis_id
+                } else {
+                    [0; 6]
+                }
+            },
+            None => {
+                [0; 6]
+            },
+        };
         let jh: JoinHandle<()> = thread::spawn(move || {
             let mut qp_list = Vec::new();
             let mut in_remote_address = 0;
@@ -321,7 +343,8 @@ impl Receiver {
                                 subnet_id,
                                 interface_id,
                                 qpn,
-                                psn
+                                psn,
+                                chassis_id
                             };
                             in_tx.send(SocketCommCommand::ConnectQp(qp_metadata)).unwrap();
                         }

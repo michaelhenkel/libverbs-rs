@@ -1,5 +1,5 @@
-use std::{cell::RefCell, ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc}};
-use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event, ibv_qp_attr_mask};
+use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc}};
+use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
 
 use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
@@ -68,7 +68,7 @@ pub struct Sender{
     connection_id: u32,
     control_buffer: ControlBuffer,
     number_of_requests: u64,
-    device: Box<IbvDevice>,
+    pub device: Box<IbvDevice>,
     receiver_socket_address: IpAddr,
     receiver_socket_port: u16,
     mrs: u32,
@@ -222,6 +222,24 @@ impl Sender {
         } else {
             format!("[{}]:{}", self.receiver_socket_address, self.receiver_socket_port)
         };
+        let chassis_id = lldpd_rs::get_remote_chassis_id(&self.device.kernel_name);
+        let chassis_id = match chassis_id{
+            Some(chassis_id) => {
+                let parts: Vec<&str> = chassis_id.split(':').collect();
+                if parts.len() == 6 {
+                    let mut chassis_id = [0; 6];
+                    for (idx, part) in parts.iter().enumerate() {
+                        chassis_id[idx] = u8::from_str_radix(part, 16).unwrap();
+                    }
+                    chassis_id
+                } else {
+                    [0; 6]
+                }
+            },
+            None => {
+                [0; 6]
+            },
+        };
         let mut stream = match TcpStream::connect(send_address.clone()){
             Ok(stream) => stream,
             Err(e) => {
@@ -255,6 +273,7 @@ impl Sender {
             self.control_buffer.out_buffer.remote_rkey = control_buffer_metadata.out_rkey;
             self.connection_id = control_buffer_metadata.connection_id;
         }
+        let mut same_switch = false;
         for qp_idx in 0..self.num_qps {
             let gid_idx = match self.qp_mode {
                 QpMode::Single => 0,
@@ -277,6 +296,7 @@ impl Sender {
                 let socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
                 if let SocketCommCommand::ConnectQp(remote_qp_metadata) = socket_comm.command {
                     qp.connect(&remote_qp_metadata)?;
+                    let remote_chassis_id = remote_qp_metadata.chassis_id;
                     let subnet_id = gid_entry.subnet_id();
                     let interface_id = gid_entry.interface_id();
                     let qpn = qp.qp_num();
@@ -285,7 +305,8 @@ impl Sender {
                         subnet_id,
                         interface_id,
                         qpn,
-                        psn
+                        psn,
+                        chassis_id
                     };
                     self.qp_list.push(qp);
                     let sock_comm = SocketComm{
@@ -293,22 +314,22 @@ impl Sender {
                     };
                     let serialized = bincode::serialize(&sock_comm).unwrap();
                     stream.write(&serialized).unwrap();
-                    
-                    
+                    if remote_chassis_id == chassis_id{
+                        same_switch = true;
+
+                    }
                 }
+            }
+            if same_switch{
+                self.num_qps = 1;
+                break;
             }
         }
         let socket_comm = SocketComm{
             command: crate::SocketCommCommand::Stop,
         };
         let serialized = bincode::serialize(&socket_comm).unwrap();
-        stream.write(&serialized).unwrap();
-        
-        /*/
-        for qp in &self.qp_list{
-            let notify_wr = IbvRecvWr::new(&self.out_buffer_mr());
-            qp.ibv_post_recv(notify_wr)?;
-        }*/     
+        stream.write(&serialized).unwrap();   
         Ok(())
     }
     pub fn event_tracker(&self) -> anyhow::Result<()> {
