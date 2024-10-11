@@ -22,6 +22,7 @@ pub struct Receiver{
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
     shared_cq: Option<Arc<IbvCq>>,
+    pub init: bool,
     pub result_recv: Arc<RwLock<channel::Receiver<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>>>,
     pub result_send: channel::Sender<(Vec<IbvQp>, Vec<QpMetadata>, u64, u32, u64, u32)>,
     pub listener: Option<TcpListener>,
@@ -92,6 +93,7 @@ impl Receiver {
             listener: None,
             tcp_stream: None,
             stage: ConnectionStages::Init,
+            init: false,
         };
         Ok(receiver)
     }
