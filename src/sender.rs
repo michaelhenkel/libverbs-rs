@@ -1,71 +1,11 @@
-use std::{ffi::c_void, io::{Read, Write}, net::{IpAddr, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc}};
+use std::{ffi::c_void, io::{self, Read, Write}, net::{IpAddr, SocketAddr, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc}};
 use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
 
 use crate::{ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Family, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
-
-pub trait SenderInterface{
-    fn qp_health_tracker(&self) -> Arc<AtomicU32>;
-    fn event_tracker(&self) -> anyhow::Result<()>;
-    fn pd(&self) -> Arc<IbvPd>;
-    fn in_buffer_ptr(&self) -> *mut c_void;
-    fn out_buffer_ptr(&self) -> *mut c_void;
-    fn in_buffer_mr(&self) -> IbvMr;
-    fn out_buffer_mr(&self) -> IbvMr;
-    fn in_remote_buffer_addr(&self) -> u64;
-    fn in_remote_buffer_rkey(&self) -> u32;
-    fn connection_id(&self) -> u32;
-    fn get_qp(&self, qp_idx: usize) -> IbvQp;
-    fn num_qps(&self) -> u32;
-    fn qps(&self) -> Vec<IbvQp>;
-}
-
-impl SenderInterface for Sender{
-    fn qp_health_tracker(&self) -> Arc<AtomicU32> {
-        self.qp_health_tracker.clone()
-    }
-    fn event_tracker(&self) -> anyhow::Result<()>{
-        self.event_tracker()
-    }
-    fn pd(&self) -> Arc<IbvPd> {
-        Arc::clone(&self.pd)
-    }
-    fn in_buffer_ptr(&self) -> *mut c_void {
-        let ptr: *mut () = &*self.control_buffer.in_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
-        ptr as *mut c_void
-    }
-    fn out_buffer_ptr(&self) -> *mut c_void {
-        let ptr = &*self.control_buffer.out_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
-        ptr as *mut c_void
-    }
-    fn in_remote_buffer_addr(&self) -> u64 {
-        self.control_buffer.in_buffer.remote_addr
-    }
-    fn in_remote_buffer_rkey(&self) -> u32 {
-        self.control_buffer.in_buffer.remote_rkey
-    }
-    fn in_buffer_mr(&self) -> IbvMr {
-        self.control_buffer.in_buffer.mr.as_ref().unwrap().clone()
-    }
-    fn out_buffer_mr(&self) -> IbvMr {
-        self.control_buffer.out_buffer.mr.as_ref().unwrap().clone()
-    }
-    fn connection_id(&self) -> u32 {
-        self.connection_id
-    }
-    fn get_qp(&self, qp_idx: usize) -> IbvQp {
-        self.qp_list[qp_idx].clone()
-    }
-    fn num_qps(&self) -> u32 {
-        self.num_qps
-    }
-    fn qps(&self) -> Vec<IbvQp> {
-        self.qp_list.clone()
-    }
-}
 pub struct Sender{
     id: u32,
-    connection_id: u32,
+    pub connection_id: u32,
     control_buffer: ControlBuffer,
     number_of_requests: u64,
     pub device: Box<IbvDevice>,
@@ -74,12 +14,15 @@ pub struct Sender{
     mrs: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
-    num_qps: u32,
+    pub num_qps: u32,
     family: Family,
     qp_mode: QpMode,
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
     shared_cq: Option<Arc<IbvCq>>,
+    tcp_stream: Option<TcpStream>,
+    pub chassis_id: [u8; 6],
+    pub remote_chassis_id: [u8; 6],
 }
 
 impl Sender {
@@ -135,6 +78,9 @@ impl Sender {
             rate_limit,
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
             shared_cq: cq,
+            tcp_stream: None,
+            chassis_id: [0; 6],
+            remote_chassis_id: [0; 6],
         })
     }
     pub fn num_qps(&self) -> u32 {
@@ -216,12 +162,116 @@ impl Sender {
         let ptr: *mut () = &*self.control_buffer.in_buffer.buffer as *const dyn ControlBufferTrait as *mut ();
         ptr as *mut c_void
     }
-    pub fn connect(&mut self) -> anyhow::Result<()> {
-        let send_address = if self.receiver_socket_address.is_ipv4() {
-            format!("{}:{}", self.receiver_socket_address, self.receiver_socket_port)
+    pub fn receive_remote_qp_metadata_and_connect(&mut self) -> anyhow::Result<bool>{
+        let mut buffer = vec![0; 1024];
+        match self.tcp_stream.as_mut().unwrap().read(&mut buffer) {
+            Ok(_) => {},
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
+        if let SocketCommCommand::InitQp(_remote_num_qps, remote_qp_metadata_list ) = socket_comm.command {
+            for (qp_idx, qp) in self.qp_list.iter_mut().enumerate(){
+                let remote_qp_metadata = &remote_qp_metadata_list[qp_idx];
+                qp.connect(remote_qp_metadata)?;
+            }
+        }
+        Ok(true)
+    }
+    pub fn init_qps_and_send_qp_metadata(&mut self) -> anyhow::Result<bool> {
+        let num_qps = if self.chassis_id == self.remote_chassis_id && self.chassis_id != [0; 6] && self.remote_chassis_id != [0; 6]{
+            1
         } else {
-            format!("[{}]:{}", self.receiver_socket_address, self.receiver_socket_port)
+            self.num_qps
         };
+        let mut qp_metadata_list = Vec::new();
+        for qp_idx in 0..num_qps{
+            let gid_idx = match self.qp_mode {
+                QpMode::Single => 0,
+                QpMode::Multi => qp_idx,
+            };
+            let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, self.family.clone());
+            if let Some((ip_addr, gid_entry)) = gid_entry{
+                let mut qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port(), self.rate_limit, self.shared_cq.clone());
+                qp.local_gid = ip_addr.to_string();
+                qp.hca_name = self.device.name.clone();
+                qp.init(gid_entry.port)?;
+                let subnet_id = gid_entry.subnet_id();
+                let interface_id = gid_entry.interface_id();
+                let qpn = qp.qp_num();
+                let psn = qp.psn();
+                let qp_metadata = QpMetadata{
+                    subnet_id,
+                    interface_id,
+                    qpn,
+                    psn,
+                    family: self.family.clone(),
+                    qp_mode: self.qp_mode.clone(),
+                };
+                self.qp_list.push(qp);
+                qp_metadata_list.push(qp_metadata);
+            }
+        }
+        let socket_comm = SocketComm{
+            command: crate::SocketCommCommand::InitQp(num_qps, qp_metadata_list),
+        };
+        let serialized = bincode::serialize(&socket_comm).unwrap();
+        match self.tcp_stream.as_mut().unwrap().write(&serialized) {
+            Ok(_) => {},
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(true)
+    }
+    pub fn receive_control_buffer_and_remote_chassis_id(&mut self) -> anyhow::Result<bool> {
+        let mut buffer = vec![0; 1024];
+        match self.tcp_stream.as_mut().unwrap().read(&mut buffer) {
+            Ok(_) => {},
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
+        if let SocketCommCommand::Mr(control_buffer_metadata) = socket_comm.command {
+            self.control_buffer.in_buffer.remote_addr = control_buffer_metadata.in_address;
+            self.control_buffer.in_buffer.remote_rkey = control_buffer_metadata.in_rkey;
+            self.control_buffer.out_buffer.remote_addr = control_buffer_metadata.out_address;
+            self.control_buffer.out_buffer.remote_rkey = control_buffer_metadata.out_rkey;
+            self.connection_id = self.connection_id;
+            self.remote_chassis_id = control_buffer_metadata.chassis_id;
+        }
+        Ok(true)
+    }
+    pub fn send_control_buffer(&mut self) -> anyhow::Result<bool>{
+        let control_buffer_metadata = ControlBufferMetadata{
+            in_address: self.control_buffer.in_buffer.local_addr,
+            in_rkey: self.control_buffer.in_buffer.local_rkey,
+            out_address: self.control_buffer.out_buffer.local_addr,
+            out_rkey: self.control_buffer.out_buffer.local_rkey,
+            length: self.control_buffer.in_buffer.length as u64,
+            nreq: 0,
+            receiver_id: 0,
+            chassis_id: self.chassis_id,
+        };
+        let socket_comm = SocketComm{
+            command: crate::SocketCommCommand::Mr(control_buffer_metadata),
+        };
+        let serialized = bincode::serialize(&socket_comm).unwrap();
+        match self.tcp_stream.as_mut().unwrap().write(&serialized) {
+            Ok(_) => {},
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(true)
+    }
+    pub fn connect(&mut self) -> anyhow::Result<bool> {
         let chassis_id = lldpd_rs::get_remote_chassis_id(&self.device.kernel_name);
         let chassis_id = match chassis_id{
             Some(chassis_id) => {
@@ -240,97 +290,28 @@ impl Sender {
                 [0; 6]
             },
         };
-        let mut stream = match TcpStream::connect(send_address.clone()){
-            Ok(stream) => stream,
-            Err(e) => {
-                println!("Failed to connect to receiver: {:?} {}", e, send_address);
-                return Err(anyhow::anyhow!("Failed to connect to receiver: {:?}", e));
+        let socket_address = SocketAddr::new(self.receiver_socket_address, self.receiver_socket_port);
+        let tcp_stream = match TcpStream::connect(socket_address) {
+            Ok(s) => {
+                s.set_nonblocking(true)?;
+                s
             }
-        };
-        let control_buffer_metadata = ControlBufferMetadata{
-            in_address: self.control_buffer.in_buffer.local_addr,
-            in_rkey: self.control_buffer.in_buffer.local_rkey,
-            out_address: self.control_buffer.out_buffer.local_addr,
-            out_rkey: self.control_buffer.out_buffer.local_rkey,
-            length: self.control_buffer.in_buffer.length as u64,
-            nreq: 0,
-            receiver_id: 0,
-            connection_id: 0,
-        };
-        let socket_comm = SocketComm{
-            command: crate::SocketCommCommand::Mr(control_buffer_metadata),
-        };
-        let serialized = bincode::serialize(&socket_comm).unwrap();
-        stream.write(&serialized).unwrap();
-        let mut buffer = vec![0; 1024];
-        stream.read(&mut buffer).unwrap();
-        
-        let socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
-        if let SocketCommCommand::Mr(control_buffer_metadata) = socket_comm.command {
-            self.control_buffer.in_buffer.remote_addr = control_buffer_metadata.in_address;
-            self.control_buffer.in_buffer.remote_rkey = control_buffer_metadata.in_rkey;
-            self.control_buffer.out_buffer.remote_addr = control_buffer_metadata.out_address;
-            self.control_buffer.out_buffer.remote_rkey = control_buffer_metadata.out_rkey;
-            self.connection_id = control_buffer_metadata.connection_id;
-        }
-        let mut same_switch = false;
-        for qp_idx in 0..self.num_qps {
-            let gid_idx = match self.qp_mode {
-                QpMode::Single => 0,
-                QpMode::Multi => qp_idx,
-            };
-            let gid_entry = self.device.gid_table.get_entry_by_index(gid_idx as usize, self.family.clone());
-            if let Some((ip_addr, gid_entry)) = gid_entry{
-                let mut qp = IbvQp::new(self.pd(), self.device.context(), gid_entry.gidx(), gid_entry.port(), self.rate_limit, self.shared_cq.clone());
-                qp.local_gid = ip_addr.to_string();
-                qp.hca_name = self.device.name.clone();
-                qp.init(gid_entry.port)?;
-                let socket_comm = SocketComm{
-                    command: crate::SocketCommCommand::InitQp(qp_idx, self.family.clone()),
-                };
-                let serialized = bincode::serialize(&socket_comm).unwrap();
-                stream.write(&serialized).unwrap();
-                let mut buffer = vec![0; 1024];
-                stream.read(&mut buffer).unwrap();
-                
-                let socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
-                if let SocketCommCommand::ConnectQp(remote_qp_metadata) = socket_comm.command {
-                    qp.connect(&remote_qp_metadata)?;
-                    let remote_chassis_id = remote_qp_metadata.chassis_id;
-                    let subnet_id = gid_entry.subnet_id();
-                    let interface_id = gid_entry.interface_id();
-                    let qpn = qp.qp_num();
-                    let psn = qp.psn();
-                    let qp_metadata = QpMetadata{
-                        subnet_id,
-                        interface_id,
-                        qpn,
-                        psn,
-                        chassis_id
-                    };
-                    self.qp_list.push(qp);
-                    let sock_comm = SocketComm{
-                        command: crate::SocketCommCommand::ConnectQp(qp_metadata),
-                    };
-                    let serialized = bincode::serialize(&sock_comm).unwrap();
-                    stream.write(&serialized).unwrap();
-                    if remote_chassis_id == chassis_id{
-                        same_switch = true;
-
+            Err(e) => {
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => {
+                        return Ok(false);
+                    }
+                    io::ErrorKind::ConnectionRefused => { return Ok(false); }
+                    _ => {
+                        println!("Error connecting to receiver: {}", e);
+                        return Err(e.into());
                     }
                 }
-            }
-            if same_switch{
-                self.num_qps = 1;
-                break;
-            }
-        }
-        let socket_comm = SocketComm{
-            command: crate::SocketCommCommand::Stop,
+            },
         };
-        let serialized = bincode::serialize(&socket_comm).unwrap();
-        stream.write(&serialized).unwrap();   
-        Ok(())
+        self.tcp_stream = Some(tcp_stream);
+        self.chassis_id = chassis_id;
+        Ok(true)
     }
     pub fn event_tracker(&self) -> anyhow::Result<()> {
         let context = self.device.context.clone();

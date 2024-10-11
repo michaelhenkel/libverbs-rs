@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use std::{collections::BTreeMap, default, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use bincode::de;
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -22,9 +23,10 @@ pub fn initialize_logger() {
 pub mod sender;
 pub mod receiver;
 
-#[derive(Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub enum QpMode{
     Single,
+    #[default]
     Multi,
 }
 #[derive(Clone)]
@@ -1647,9 +1649,10 @@ impl IbvSendFlags{
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub enum Family{
     Inet,
+    #[default]
     Inet6,
 }
 
@@ -1667,7 +1670,7 @@ pub struct ControlBufferMetadata{
     pub length: u64,
     pub nreq: u64,
     pub receiver_id: u32,
-    pub connection_id: u32,
+    pub chassis_id: [u8; 6],
 }
 
 impl ControlBufferMetadata{
@@ -1684,6 +1687,7 @@ pub trait ControlBufferTrait{
     fn address(&self) -> u64;
     fn print(&self);
 }
+
 
 pub struct ControlBuffer{
     in_buffer: InBuffer,
@@ -1718,7 +1722,8 @@ pub struct QpMetadata{
     pub interface_id: u64,
     pub psn: u32,
     pub qpn: u32,
-    pub chassis_id: [u8; 6],
+    pub family: Family,
+    pub qp_mode: QpMode
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1729,7 +1734,7 @@ pub struct SocketComm{
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketCommCommand{
     Mr(ControlBufferMetadata),
-    InitQp(u32, Family),
+    InitQp(u32, Vec<QpMetadata>),
     ConnectQp(QpMetadata),
     Continue,
     Stop,
@@ -1855,4 +1860,21 @@ macro_rules! info {
         rust_info!($($arg)*);
         $logger.info(&format!($($arg)*));
     }};
+}
+
+#[derive(Default, Debug)]
+pub enum ConnectionStages{
+    #[default]
+    Init = 0,
+    SenderInitialized = 1,
+    SenderConnected = 2,
+    SenderControlBufferSent = 3,
+    SenderControlBufferReceived = 4,
+    SenderQpsInitialized = 5,
+    SenderQpsConnected = 6,
+    ReceiverAccepted = 7,
+    ReceiverControlBufferReceived = 8,
+    ReceiverControlBufferSent = 9,
+    ReceiverQpsInitialized = 10,
+    ReceiverQpsConnected = 11,
 }
