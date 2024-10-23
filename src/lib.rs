@@ -1,5 +1,4 @@
-use std::{collections::BTreeMap, default, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
-use bincode::de;
+use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -10,7 +9,7 @@ use std::fmt::Debug;
 static INIT: Once = Once::new();
 const BATCH_SIZE: usize = 2000;
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
-pub const SLOT_COUNT: usize = 256;
+
 
 pub fn initialize_logger() {
     INIT.call_once(|| {
