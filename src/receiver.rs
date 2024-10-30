@@ -1,8 +1,6 @@
-use std::{ffi::c_void, io::{self, Read, Write}, net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream}, os::fd::RawFd, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}, thread::{self, JoinHandle}};
-use rdma_sys::{ibv_async_event, ibv_async_event_element_t, ibv_event_type, ibv_get_async_event};
+use std::{ffi::c_void, io::{self, Read, Write}, net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream}, sync::{atomic::AtomicU32, Arc, RwLock}};
 use crossbeam::channel;
-
-use crate::{ConnectionStages, ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvEventType, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
+use crate::{ConnectionStages, ControlBuffer, ControlBufferMetadata, ControlBufferTrait, Hints, IbvAccessFlags, IbvCompChannel, IbvCq, IbvDevice, IbvMr, IbvPd, IbvQp, InBuffer, LookUpBy, OutBuffer, QpMetadata, QpMode, SocketComm, SocketCommCommand};
 
 pub struct Receiver{
     id: u32,
@@ -15,10 +13,8 @@ pub struct Receiver{
     mrs: u32,
     pub pd: Arc<IbvPd>,
     pub qp_list: Vec<IbvQp>,
-    join_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     qp_metadata_list: Vec<QpMetadata>,
     remote_qp_metadata_list: Vec<QpMetadata>,
-    qp_mode: QpMode,
     rate_limit: Option<u32>,
     qp_health_tracker: Arc<AtomicU32>,
     shared_cq: Option<Arc<IbvCq>>,
@@ -31,7 +27,7 @@ pub struct Receiver{
 }
 
 impl Receiver {
-    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, qp_mode: QpMode, rate_limit: Option<u32>, shared_cq: bool) -> anyhow::Result<Receiver> {
+    pub fn new<C: ControlBufferTrait>(look_up_by: LookUpBy, listen_socket_port: u16, rate_limit: Option<u32>, shared_cq: bool) -> anyhow::Result<Receiver> {
         let device = IbvDevice::new(look_up_by)?;
         if device.context.as_ptr().is_null() {
             return Err(anyhow::anyhow!("Device context is null"));
@@ -81,10 +77,8 @@ impl Receiver {
             mrs: 0,
             pd,
             qp_list: Vec::new(),
-            join_handle: Arc::new(Mutex::new(None)),
             remote_qp_metadata_list: Vec::new(),
             qp_metadata_list: Vec::new(),
-            qp_mode,
             rate_limit,
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
             shared_cq: cq,
@@ -361,34 +355,4 @@ impl Receiver {
         self.qp_health_tracker.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
 
-}
-
-fn socket_listener(listen_address: IpAddr, port: u16, out_tx: std::sync::mpsc::Sender<SocketCommCommand>, in_rx: std::sync::mpsc::Receiver<SocketCommCommand>) -> anyhow::Result<()>{
-    let address = format!("{}:{}", listen_address, port);
-    thread::spawn(move || {
-        let listener = TcpListener::bind(address).unwrap();
-        for stream in listener.incoming() {
-            let mut stream = stream.unwrap();
-            loop{
-                let mut buffer = vec![0; 1024]; // Adjust size if necessary
-                let bytes_read = stream.read(&mut buffer).unwrap();
-                if bytes_read == 0 {
-                    break;
-                }
-                let remote_socket_comm: SocketComm = bincode::deserialize(&buffer).unwrap();
-                out_tx.send(remote_socket_comm.command).unwrap();
-                let local_socket_comm = in_rx.recv().unwrap();
-                if let SocketCommCommand::Stop = local_socket_comm {
-                    break;
-                }
-                if let SocketCommCommand::Continue = local_socket_comm {
-                    continue;
-                }
-                let serialized = bincode::serialize(&local_socket_comm).unwrap();
-                stream.write_all(&serialized).unwrap();
-            }
-            break;
-        }
-    });
-    Ok(())
 }
