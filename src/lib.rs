@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::PathBuf, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use std::{collections::BTreeMap, ffi::{c_void, CStr}, fs::{self, File}, io::{self, BufReader, Read}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::BitOr, path::{Path, PathBuf}, pin::Pin, ptr::{self, null_mut}, sync::Arc};
+use rand::Rng;
 use rdma_sys::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -730,11 +731,11 @@ unsafe impl Send for IbvGid{}
 unsafe impl Sync for IbvGid{}
 #[derive(Clone)]
 pub struct IbvDevice{
-    inner: Box<*mut ibv_device>,
-    gid_table: GidTable,
-    context: Arc<IbvContext>,
-    name: String,
-    kernel_name: String
+    pub inner: Box<*mut ibv_device>,
+    pub gid_table: GidTable,
+    pub context: Arc<IbvContext>,
+    pub name: String,
+    pub kernel_name: String
 }
 
 impl IbvDevice{
@@ -788,7 +789,7 @@ pub enum LookUpBy{
     None,
 }
 
-fn get_kernel_name(device_name: &str) -> anyhow::Result<String> {
+pub fn get_kernel_name(device_name: &str) -> anyhow::Result<String> {
     let sysfs_path = format!("/sys/class/infiniband/{}/device/net", device_name);
     match fs::read_dir(sysfs_path) {
         Ok(entries) => {
@@ -863,7 +864,7 @@ fn device_lookup(look_up_by: LookUpBy) -> anyhow::Result<(*mut ibv_device, *mut 
     return Err(anyhow::anyhow!("Device not found"));
 }
 
-fn get_gid_table(device_ctx: *mut ibv_context, device_name: &str) -> anyhow::Result<GidTable>{
+pub fn get_gid_table(device_ctx: *mut ibv_context, device_name: &str) -> anyhow::Result<GidTable>{
     let mut device_attr: ibv_device_attr = unsafe { std::mem::zeroed::<ibv_device_attr>() };
     let mut gid_table = GidTable{
         v4_table: BTreeMap::new(),
@@ -924,16 +925,40 @@ fn get_gid_table(device_ctx: *mut ibv_context, device_name: &str) -> anyhow::Res
     }
     Ok(gid_table)
 }
-
+fn read_file_contents(path: &Path) -> io::Result<String> {
+    let file = File::open(path)?;
+    let mut buf_reader = BufReader::new(file);
+    let mut contents = String::new();
+    buf_reader.read_to_string(&mut contents)?;
+    Ok(contents)
+}
 fn read_gid_type(device_name: &str, port: u8, gid_index: i32) -> anyhow::Result<GidType> {
     // Construct the file path
     let path = PathBuf::from(format!(
         "/sys/class/infiniband/{}/ports/{}/gid_attrs/types/{}",
         device_name, port, gid_index
     ));
+    let mut counter = 0;
+    let gid_type = loop{
+        match read_file_contents(&path){
+            Ok(contents) => {
+                break contents;
+            },
+            Err(e) => {
+                if counter == 1000 {
+                    return Err(anyhow::anyhow!("Failed to read from path {:#?} {:#?}", path, e));
+                } else {
+                    counter += 1;
+                    let random_duration = std::time::Duration::from_millis(rand::thread_rng().gen_range(10..100));
+                    std::thread::sleep(random_duration);
+                    continue;
+                }
+            }
+        }
+    };
 
     // Read the file contents
-    let gid_type = fs::read_to_string(path).map_err(|_| anyhow::anyhow!("failed to read"))?;
+    //let gid_type = fs::read_to_string(path).map_err(|_| anyhow::anyhow!("failed to read"))?;
 
     // Return the contents as a String
     let gid_type = GidType::from_str(gid_type.trim());
@@ -1080,7 +1105,7 @@ impl GidType{
 }
 
 pub struct IbvContext{
-    inner: Box<*mut ibv_context>,
+    pub inner: Box<*mut ibv_context>,
 }
 
 impl Default for IbvContext{

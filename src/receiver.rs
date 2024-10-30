@@ -97,6 +97,14 @@ impl Receiver {
         };
         Ok(receiver)
     }
+    pub fn close_listener_and_tcp_stream(&mut self){
+        if let Some(listener) = self.listener.take(){
+            drop(listener);
+        }
+        if let Some(tcp_stream) = self.tcp_stream.take(){
+            drop(tcp_stream);
+        }
+    }
     pub fn reset_nreqs(&mut self) {
         self.number_of_requests = 0;
     }
@@ -183,6 +191,9 @@ impl Receiver {
         self.listen_address.clone()
     }
     pub fn listen(&mut self, hints: Hints) -> anyhow::Result<()> {
+        if self.listener.is_some() {
+            return Ok(());
+        }
         let address = match hints{
             Hints::Address(address) => {
                 address
@@ -328,6 +339,9 @@ impl Receiver {
         Ok(true)
     }
     pub fn accept(&mut self) -> anyhow::Result<bool> {
+        if self.tcp_stream.is_some() {
+            return Ok(true);
+        }
         match self.listener.as_mut().unwrap().accept(){
             Ok((tcp_stream, _)) => {
                 tcp_stream.set_nonblocking(true)?;
@@ -338,98 +352,6 @@ impl Receiver {
             }
             Err(e) => return Err(e.into()),
         }
-
-        /*
-        let result_recv = self.result_recv.clone();
-        let result_recv = result_recv.read().unwrap();
-        let (qp_list, qp_metadata_list, in_remote_address, in_remote_key, out_remote_address, out_remote_key) = match result_recv.recv_timeout(std::time::Duration::from_micros(50)){
-            Ok(result) => {
-                result
-            },
-            Err(e) => {
-                return Err(anyhow::anyhow!("Error receiving result: {:?}", e));
-            }
-        };
-        self.qp_list = qp_list;
-        self.control_buffer.in_buffer.remote_addr = in_remote_address;
-        self.control_buffer.in_buffer.remote_rkey = in_remote_key;
-        self.control_buffer.out_buffer.remote_addr = out_remote_address;
-        self.control_buffer.out_buffer.remote_rkey = out_remote_key;
-        self.qp_metadata_list = qp_metadata_list;
-        for (qp_idx, qp) in self.qp_list.iter_mut().enumerate() {
-            let remote_qp_metadata = self.qp_metadata_list.get(qp_idx).unwrap();
-            qp.connect(remote_qp_metadata)?;
-        }
-        Ok(())
-    }
-    pub fn event_tracker(&self) -> anyhow::Result<()> {
-        let context = self.device.context.clone();
-        let async_fd: RawFd = unsafe { (*(*context.inner)).async_fd };
-        let qp_list = self.qp_list.clone();
-        let qp_health_tracker = self.qp_health_tracker.clone();
-        std::thread::spawn(move || {
-            use libc::{poll, pollfd, POLLIN};
-            let mut fds = [pollfd {
-                fd: async_fd,
-                events: POLLIN,
-                revents: 0,
-            }];
-            loop {
-                let ret = unsafe { poll(fds.as_mut_ptr(), 1, -1) };
-                if ret < 0 {
-                    // Handle error
-                    eprintln!("Error polling async_fd");
-                    break;
-                }
-                if fds[0].revents & POLLIN != 0 {
-                    // An event is available
-                    let element = unsafe { std::mem::zeroed::<ibv_async_event_element_t>()};
-                    let event_type = unsafe { std::mem::zeroed::<ibv_event_type>()};
-                    let mut event = ibv_async_event {
-                        event_type,
-                        element,
-                    };
-                    let ret = unsafe { ibv_get_async_event(context.as_ptr(), &mut event) };
-                    if ret != 0 {
-                        // Handle error
-                        eprintln!("Error getting async event");
-                        break;
-                    }
-                    match event.event_type {
-                        ibv_event_type::IBV_EVENT_QP_FATAL |
-                        ibv_event_type::IBV_EVENT_QP_REQ_ERR |
-                        ibv_event_type::IBV_EVENT_QP_ACCESS_ERR => {
-                            // Check if the event is related to your QP
-                            for (qp_idx, qp) in qp_list.iter().enumerate() {
-                                if unsafe { event.element.qp == qp.as_ptr() }{
-                                    println!("receiver QP {} event {:?} state: {:?}", qp_idx, IbvEventType::from(event.event_type), qp.state().unwrap());
-                                    qp_health_tracker.fetch_or(1 << qp_idx, std::sync::atomic::Ordering::SeqCst);
-                                }
-                            }
-                        },
-                        ibv_event_type::IBV_EVENT_PORT_ERR => {
-                            qp_health_tracker.fetch_or((1 << qp_list.len()) - 1, std::sync::atomic::Ordering::SeqCst);
-                            for (qp_idx, qp) in qp_list.iter().enumerate() {
-                                println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
-                            }
-                            println!("receiver received port error event");
-                        },
-                        ibv_event_type::IBV_EVENT_GID_CHANGE => {
-                            for (qp_idx, qp) in qp_list.iter().enumerate() {
-                                println!("receiver QP {} state: {:?}", qp_idx, qp.state().unwrap());
-                            }
-                            println!("receiver received GID change event");
-                        },
-                        _ => {
-                            let et = IbvEventType::from(event.event_type);
-                            // Handle other events if necessary
-                            println!("receiver received good event {:?}", et);
-                        }
-                    }
-                }
-            }
-        });
-        */
         Ok(true)
     }
     pub fn qp_health_tracker(&self) -> Arc<AtomicU32> {

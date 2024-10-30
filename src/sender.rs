@@ -21,7 +21,7 @@ pub struct Sender{
     qp_health_tracker: Arc<AtomicU32>,
     shared_cq: Option<Arc<IbvCq>>,
     tcp_stream: Option<TcpStream>,
-    pub chassis_id: [u8; 6],
+    pub chassis_id: Option<[u8; 6]>,
     pub remote_chassis_id: [u8; 6],
 }
 
@@ -79,7 +79,7 @@ impl Sender {
             qp_health_tracker: Arc::new(AtomicU32::new(0)),
             shared_cq: cq,
             tcp_stream: None,
-            chassis_id: [0; 6],
+            chassis_id: None,
             remote_chassis_id: [0; 6],
         })
     }
@@ -126,6 +126,9 @@ impl Sender {
         self.control_buffer.out_buffer.local_lkey = out_buffer_mr.lkey();
         self.control_buffer.out_buffer.mr = Some(out_buffer_mr);
         Ok(())
+    }
+    pub fn close_tcp_stream(&mut self){
+        self.tcp_stream = None;
     }
     pub fn reset_nreqs(&mut self) {
         self.number_of_requests = 0;
@@ -181,7 +184,11 @@ impl Sender {
         Ok(true)
     }
     pub fn init_qps_and_send_qp_metadata(&mut self) -> anyhow::Result<bool> {
-        let num_qps = if self.chassis_id == self.remote_chassis_id && self.chassis_id != [0; 6] && self.remote_chassis_id != [0; 6]{
+        let local_chassis_id = match self.chassis_id{
+            Some(chassis_id) => chassis_id,
+            None => [0; 6],
+        };
+        let num_qps = if local_chassis_id == self.remote_chassis_id && local_chassis_id != [0; 6] && self.remote_chassis_id != [0; 6]{
             1
         } else {
             self.num_qps
@@ -256,7 +263,7 @@ impl Sender {
             length: self.control_buffer.in_buffer.length as u64,
             nreq: 0,
             receiver_id: 0,
-            chassis_id: self.chassis_id,
+            chassis_id: self.chassis_id.unwrap_or_default(),
         };
         let socket_comm = SocketComm{
             command: crate::SocketCommCommand::Mr(control_buffer_metadata),
@@ -272,45 +279,49 @@ impl Sender {
         Ok(true)
     }
     pub fn connect(&mut self) -> anyhow::Result<bool> {
-        let chassis_id = lldpd_rs::get_remote_chassis_id(&self.device.kernel_name);
-        let chassis_id = match chassis_id{
-            Some(chassis_id) => {
-                let parts: Vec<&str> = chassis_id.split(':').collect();
-                if parts.len() == 6 {
-                    let mut chassis_id = [0; 6];
-                    for (idx, part) in parts.iter().enumerate() {
-                        chassis_id[idx] = u8::from_str_radix(part, 16).unwrap();
+        if self.chassis_id.is_none(){
+            let chassis_id = lldpd_rs::get_remote_chassis_id(&self.device.kernel_name);
+            let chassis_id = match chassis_id{
+                Some(chassis_id) => {
+                    let parts: Vec<&str> = chassis_id.split(':').collect();
+                    if parts.len() == 6 {
+                        let mut chassis_id = [0; 6];
+                        for (idx, part) in parts.iter().enumerate() {
+                            chassis_id[idx] = u8::from_str_radix(part, 16).unwrap();
+                        }
+                        chassis_id
+                    } else {
+                        [0; 6]
                     }
-                    chassis_id
-                } else {
+                },
+                None => {
                     [0; 6]
+                },
+            };
+            self.chassis_id = Some(chassis_id);
+        }
+        if self.tcp_stream.is_none(){
+            let socket_address = SocketAddr::new(self.receiver_socket_address, self.receiver_socket_port);
+            let tcp_stream = match TcpStream::connect(socket_address) {
+                Ok(s) => {
+                    s.set_nonblocking(true)?;
+                    s
                 }
-            },
-            None => {
-                [0; 6]
-            },
-        };
-        let socket_address = SocketAddr::new(self.receiver_socket_address, self.receiver_socket_port);
-        let tcp_stream = match TcpStream::connect(socket_address) {
-            Ok(s) => {
-                s.set_nonblocking(true)?;
-                s
-            }
-            Err(e) => {
-                match e.kind() {
-                    io::ErrorKind::WouldBlock => {
-                        return Ok(false);
+                Err(e) => {
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            return Ok(false);
+                        }
+                        io::ErrorKind::ConnectionRefused => { return Ok(false); }
+                        _ => {
+                            println!("Error connecting to receiver: {}", e);
+                            return Err(e.into());
+                        }
                     }
-                    io::ErrorKind::ConnectionRefused => { return Ok(false); }
-                    _ => {
-                        println!("Error connecting to receiver: {}", e);
-                        return Err(e.into());
-                    }
-                }
-            },
-        };
-        self.tcp_stream = Some(tcp_stream);
-        self.chassis_id = chassis_id;
+                },
+            };
+            self.tcp_stream = Some(tcp_stream);
+        }
         Ok(true)
     }
     pub fn event_tracker(&self) -> anyhow::Result<()> {
